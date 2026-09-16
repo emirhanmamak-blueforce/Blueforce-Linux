@@ -41,3 +41,8 @@ id_ed25519*
 *credentials*
 *token*
 *.secret
+
+# Credential files delivered by `admin/bf-creds --fetch` (<dealer-number>.txt).
+# They live only in the checkout that runs the delivery, are root-owned on the
+# device (mode 0600 inside a mode 0700 directory), and are never committed.
+admin/secrets/

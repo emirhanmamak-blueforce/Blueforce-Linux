@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+#
+# bf-creds — optional, default-OFF credential generation and local delivery.
+#
+# Scope (deliberate, decided with the operator)
+#   * DEFAULT BEHAVIOUR: nothing is generated. Unless `--generate` (or
+#     BF_GENERATE_CREDENTIALS=1) is given, no password is created and the
+#     command says so explicitly.
+#   * With `--generate`: a device credential record is written to
+#     /root/blueforce-credentials.txt with mode 0600. It carries the device
+#     identity (BF-<no>), the hostname, the creation time, the WireGuard
+#     PUBLIC key plus the private key PATH (never its contents), the RustDesk
+#     ID when the installer recorded one, and a freshly generated local
+#     administrator password.
+#   * With `--fetch`: the record is copied to
+#     <repo>/admin/secrets/<dealer-number>.txt (directory 0700, file 0600).
+#     That path is git-ignored; it must never be committed.
+#   * Secrets are written to files only. No password is ever printed to
+#     stdout/stderr, written to a log, or passed through argv — so it cannot
+#     land in the shell history or the process list.
+#
+# What this tool does NOT do
+#   Remote access stays exactly as the installer left it: OpenSSH password
+#   authentication stays disabled (`PasswordAuthentication no`,
+#   docs/06-USERS-SSH-AND-PERMISSIONS.md, docs/11-SECURITY-HARDENING.md) and
+#   the `blueforce` maintenance account stays locked. bf-creds never edits
+#   sshd_config, never unlocks an account, and never enables a password login
+#   path; it is only an optional *local* delivery helper. See README.md
+#   ("admin/" section).
+#
+# Usage: sudo bf-creds [--generate] [--fetch] [--repo DIR] [--dealer-id N] [--help]
+#
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]:-}"
+SELF_REAL="$(readlink -f "$SELF" 2>/dev/null || printf '%s' "$SELF")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF_REAL")" && pwd)"
+# shellcheck source=lib/creds.sh
+source "$SCRIPT_DIR/lib/creds.sh"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+GENERATE=0
+FETCH=0
+REPO_OVERRIDE=""
+DEALER_OVERRIDE=""
+
+usage() {
+    cat <<'EOF'
+Usage: sudo bf-creds [--generate] [--fetch] [--repo DIR] [--dealer-id NNNNNNNN] [--help]
+
+Report the device identity and the secrets that already exist on this host, and
+optionally generate a local credential record and deliver it into the repository
+checkout.
+
+Options:
+  --generate        Create the credential record (default path:
+                    /root/blueforce-credentials.txt, mode 0600). Without this
+                    flag NO password is generated and the command says so.
+  --fetch           Copy the credential record to <repo>/admin/secrets/<dealer>.txt
+                    (directory 0700, file 0600, git-ignored).
+  --repo DIR        Repository root used as the --fetch destination
+                    (default: the checkout this tool lives in).
+  --dealer-id N     Eight-digit dealer number. Default: detected from the device
+                    identity (installer state file, then the hostname).
+  --help, -h        Show this help and exit.
+
+Environment:
+  BF_GENERATE_CREDENTIALS=1   Same as --generate (still opt-in; the default is off).
+  BF_CREDENTIALS_FILE=PATH    Override the credential record path.
+  BF_WG_DIR=PATH              Override the WireGuard directory.
+  BF_STATE_FILE=PATH          Override the installer state file.
+  BF_RUSTDESK_ID_FILE=PATH    Override the recorded RustDesk ID file.
+
+Guarantees:
+  * The generated password is written to the record file only. It is never
+    printed, never logged, and never placed on a command line.
+  * The WireGuard private key is never read: only its path is reported.
+  * Remote access is not changed: SSH password authentication stays disabled
+    and the `blueforce` account stays locked.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --generate) GENERATE=1; shift ;;
+        --fetch) FETCH=1; shift ;;
+        --repo) REPO_OVERRIDE="${2:?missing value for --repo}"; shift 2 ;;
+        --dealer-id) DEALER_OVERRIDE="${2:?missing value for --dealer-id}"; shift 2 ;;
+        --help|-h) usage; exit 0 ;;
+        *) printf 'ERROR: unknown argument: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+if [[ "${BF_GENERATE_CREDENTIALS:-0}" == "1" ]]; then
+    GENERATE=1
+fi
+if [[ -n "$DEALER_OVERRIDE" ]] && [[ ! "$DEALER_OVERRIDE" =~ ^[0-9]{8}$ ]]; then
+    printf 'ERROR: --dealer-id must be exactly 8 digits\n' >&2
+    exit 2
+fi
+if [[ -n "$REPO_OVERRIDE" ]]; then
+    if [[ ! -d "$REPO_OVERRIDE" ]]; then
+        printf 'ERROR: --repo must name an existing directory: %s\n' "$REPO_OVERRIDE" >&2
+        exit 2
+    fi
+    REPO_ROOT="$(cd "$REPO_OVERRIDE" && pwd)"
+fi
+
+resolve_dealer_number() {
+    local id=""
+    if [[ -n "$DEALER_OVERRIDE" ]]; then
+        printf '%s' "$DEALER_OVERRIDE"
+        return 0
+    fi
+    id="$(bf_detect_device_id || true)"
+    bf_dealer_number "$id"
+}
+
+print_report() {
+    local id="" dealer="" host="" wg_pub="" wg_path="" rustdesk=""
+    id="$(bf_detect_device_id || true)"
+    dealer="$(resolve_dealer_number || true)"
+    host="$(hostname 2>/dev/null || echo unknown)"
+    printf 'device\n'
+    printf '  device_id        : %s\n' "${id:-unknown}"
+    printf '  dealer_number    : %s\n' "${dealer:-unknown}"
+    printf '  hostname         : %s\n' "$host"
+    printf 'wireguard\n'
+    if wg_pub="$(bf_wireguard_public_key)"; then
+        printf '  public_key       : %s\n' "$wg_pub"
+    else
+        printf '  public_key       : not present\n'
+    fi
+    if wg_path="$(bf_wireguard_private_key_path)"; then
+        printf '  private_key_path : %s (contents are never read or recorded)\n' "$wg_path"
+    else
+        printf '  private_key_path : not present\n'
+    fi
+    printf 'rustdesk\n'
+    if rustdesk="$(bf_rustdesk_id)"; then
+        printf '  id               : %s\n' "$rustdesk"
+    else
+        printf '  id               : not present\n'
+    fi
+    printf 'credential record\n'
+    printf '  path             : %s\n' "$BF_CREDENTIALS_FILE"
+    if [[ -f "$BF_CREDENTIALS_FILE" ]]; then
+        printf '  present          : yes (mode %s)\n' "$(bf_file_mode "$BF_CREDENTIALS_FILE")"
+        if bf_has_generated_password "$BF_CREDENTIALS_FILE"; then
+            printf '  administrator password recorded : yes (the value lives only in the file)\n'
+        else
+            printf '  administrator password recorded : no\n'
+        fi
+    else
+        printf '  present          : no\n'
+    fi
+}
+
+# credentials_body <timestamp> <password>   (stdout = the record file body)
+# The only caller pipes this straight into bf_write_secret_file; the body is
+# never printed anywhere else.
+credentials_body() {
+    local ts="$1" password="$2"
+    local id="" dealer="" host="" wg_pub="" wg_path="" rustdesk=""
+    id="$(bf_detect_device_id || true)"
+    dealer="$(resolve_dealer_number || true)"
+    host="$(hostname 2>/dev/null || echo unknown)"
+    wg_pub="$(bf_wireguard_public_key || true)"
+    wg_path="$(bf_wireguard_private_key_path || true)"
+    rustdesk="$(bf_rustdesk_id || true)"
+    cat <<EOF
+# BLUEFORCE DEVICE CREDENTIALS
+#
+# Generated by bf-creds on the device. Root-owned, mode 0600.
+# Delivery target (bf-creds --fetch): <checkout>/${BF_SECRETS_SUBDIR}/<dealer-number>.txt
+# That path is git-ignored and must never be committed.
+#
+# Remote access is NOT changed by this tool: OpenSSH password authentication
+# stays disabled (PasswordAuthentication no) and the blueforce maintenance
+# account stays locked. See docs/06-USERS-SSH-AND-PERMISSIONS.md.
+
+device_id: ${id:-unknown}
+dealer_number: ${dealer:-unknown}
+hostname: ${host}
+generated_at: ${ts}
+generator: bf-creds
+
+[wireguard]
+public_key: ${wg_pub:-not-present}
+private_key_path: ${wg_path:-not-present}
+private_key: NOT RECORDED (the WireGuard private key never leaves the device)
+
+[rustdesk]
+id: ${rustdesk:-not-present}
+
+[generated]
+local_administrator_password: ${password}
+note: recorded for delivery only; bf-creds does not apply this password to any
+  account, does not edit sshd_config, and does not open a password login path.
+  Applying it stays a deliberate operator action on the device console.
+EOF
+}
+
+print_report
+
+if [[ "$GENERATE" -eq 1 ]]; then
+    generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+    password="$(bf_generate_secret)" || bf_die 'cannot generate a random secret (openssl and /dev/urandom are both unavailable)'
+    if ! credentials_body "$generated_at" "$password" | bf_write_secret_file "$BF_CREDENTIALS_FILE"; then
+        bf_die "could not write the credential record: $BF_CREDENTIALS_FILE"
+    fi
+    unset password
+    printf '\ncredential record written : %s (mode 600)\n' "$BF_CREDENTIALS_FILE"
+    printf '  the generated local administrator password exists in that file only;\n'
+    printf '  bf-creds does not apply it to an account, does not enable SSH password\n'
+    printf '  login, and leaves the blueforce account locked.\n'
+else
+    printf '\ncredential generation : DISABLED (this is the default)\n'
+    printf '  no password was generated. Re-run with --generate (or BF_GENERATE_CREDENTIALS=1)\n'
+    printf '  to create %s.\n' "$BF_CREDENTIALS_FILE"
+fi
+
+if [[ "$FETCH" -eq 1 ]]; then
+    if [[ ! -s "$BF_CREDENTIALS_FILE" ]]; then
+        bf_die "--fetch needs an existing credential record: $BF_CREDENTIALS_FILE (run --generate first)"
+    fi
+    dealer="$(resolve_dealer_number || true)"
+    if [[ -z "$dealer" ]]; then
+        bf_die 'cannot determine the dealer number; pass --dealer-id <8 digits> (fail-closed: the delivery file name depends on it)'
+    fi
+    destination="$(bf_secrets_target_path "$REPO_ROOT" "$dealer")" || bf_die 'cannot build the delivery path'
+    if ! bf_deliver_secret "$BF_CREDENTIALS_FILE" "$destination"; then
+        bf_die "could not deliver the credential record to: $destination"
+    fi
+    printf '\ncredential record delivered : %s (mode 600, directory 700, git-ignored)\n' "$destination"
+fi

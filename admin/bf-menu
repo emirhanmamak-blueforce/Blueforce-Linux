@@ -1,0 +1,1626 @@
+#!/usr/bin/env bash
+#
+# bf-menu -- numbered operator console for the Blueforce fleet.
+#
+# One entry point for two very different jobs:
+#   * category 1 installs THIS device locally, on the machine you are sitting at
+#   * categories 2 and 5 drive the fleet through the existing Ansible playbooks
+#     with an explicit --limit and never invent a new playbook
+#
+# Safety rules this console is built around:
+#   * every command is printed before it runs and must be confirmed,
+#   * destructive operations ask a second, explicit question,
+#   * wave-gated playbooks are never handed a gate flag silently: the operator
+#     has to confirm the gate (and type "production" for the production wave),
+#   * the audit log is mode 600 and never receives a secret: only the sanitized
+#     command, its exit status and the target are recorded (raw playbook output
+#     is shown on screen but never written to the log),
+#   * a missing Ansible, inventory or playbook produces an explanation, never a
+#     silent fallback to "something similar".
+#
+# Usage: admin/bf-menu [options]      (see --help)
+#
+set -euo pipefail
+
+BF_MENU_VERSION="1.0.0"
+BF_MENU_NAME="admin/bf-menu"
+DEFAULT_LOG_FILE="/var/log/blueforce-console.log"
+INSTALLER_REL="scripts/install/blueforce-install.sh"
+PLAYBOOK_DIR_REL="ansible/playbooks"
+
+# ---------------------------------------------------------------------------
+# Globals (set by argument parsing / discovery)
+# ---------------------------------------------------------------------------
+BF_REPO="${BF_REPO:-}"
+BF_INVENTORY="${BF_INVENTORY:-}"
+BF_LOG_FILE="${BF_CONSOLE_LOG:-$DEFAULT_LOG_FILE}"
+BF_LOG_READY=0
+BF_DRY_RUN=0
+BF_INVENTORY_CACHE_FILE=""
+BF_CMD=()
+BF_EXTRA=()
+BF_LAST_RC=0
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+bf_usage() {
+    cat <<EOF
+Usage: $BF_MENU_NAME [options]
+
+Numbered operator console for the Blueforce fleet ($BF_MENU_VERSION).
+
+  Category 1 installs THIS device locally with the one-click installer.
+  Categories 2 and 5 run the repository's existing Ansible playbooks against
+  the fleet, always with an explicit --limit. No new playbook is introduced
+  and no device outside the inventory is ever addressed.
+
+Options:
+  -h, --help             Show this help and exit
+  -V, --version          Show the console version and exit
+      --repo PATH        Repository root (default: parent directory of this script)
+      --inventory PATH   Ansible inventory (default: \$repo/ansible/inventory/hosts.yml)
+      --log-file PATH    Audit log (default: $DEFAULT_LOG_FILE)
+      --dry-run          Print every command instead of running it
+      --no-color         Disable ANSI colors (also honored: NO_COLOR)
+      --list             Print the operation catalogue and exit
+      --list-targets     Print inventory groups and host counts, then exit
+
+Environment:
+  BF_REPO, BF_INVENTORY, BF_CONSOLE_LOG   same as the options above
+
+Exit status: 0 success or clean quit, 1 failure, 2 usage error.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+bf_parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) bf_usage; exit 0 ;;
+            -V|--version) printf '%s %s\n' "$BF_MENU_NAME" "$BF_MENU_VERSION"; exit 0 ;;
+            --repo) [[ $# -ge 2 ]] || { printf 'ERROR: --repo needs a path\n' >&2; exit 2; }; BF_REPO="$2"; shift 2 ;;
+            --inventory) [[ $# -ge 2 ]] || { printf 'ERROR: --inventory needs a path\n' >&2; exit 2; }; BF_INVENTORY="$2"; shift 2 ;;
+            --log-file) [[ $# -ge 2 ]] || { printf 'ERROR: --log-file needs a path\n' >&2; exit 2; }; BF_LOG_FILE="$2"; shift 2 ;;
+            --dry-run) BF_DRY_RUN=1; shift ;;
+            --no-color) TUI_COLOR_MODE=never; shift ;;
+            --list) BF_LIST=1; shift ;;
+            --list-targets) BF_LIST_TARGETS=1; shift ;;
+            *) printf 'ERROR: unknown argument: %s\n' "$1" >&2; bf_usage >&2; exit 2 ;;
+        esac
+    done
+}
+BF_LIST=0
+BF_LIST_TARGETS=0
+
+# ---------------------------------------------------------------------------
+# Repository discovery
+# ---------------------------------------------------------------------------
+bf_resolve_repo() {
+    local self self_real self_dir
+    if [[ -z "$BF_REPO" ]]; then
+        # bf-bootstrap.sh links this script into a bin directory, so the path we
+        # were invoked through is usually a symlink: resolve it before deriving
+        # the repository root.
+        self="${BASH_SOURCE[0]}"
+        self_real="$(readlink -f -- "$self" 2>/dev/null || printf '%s' "$self")"
+        self_dir="$(cd "$(dirname "$self_real")" && pwd)"
+        BF_REPO="$(cd "$self_dir/.." && pwd)"
+    fi
+    if [[ ! -d "$BF_REPO/ansible" || ! -d "$BF_REPO/scripts" ]]; then
+        printf 'ERROR: %s does not look like the Blueforce repository (no ansible/ and scripts/).\n' "$BF_REPO" >&2
+        printf '       Clone it and run the console from the checkout, or pass --repo PATH.\n' >&2
+        exit 2
+    fi
+    if [[ ! -r "$BF_REPO/admin/lib/tui.sh" || ! -r "$BF_REPO/admin/lib/targets.sh" ]]; then
+        printf 'ERROR: %s/admin/lib/tui.sh or targets.sh is missing.\n' "$BF_REPO" >&2
+        printf '       The console needs its libraries next to it (admin/lib/).\n' >&2
+        exit 2
+    fi
+    export BF_REPO
+}
+
+# ---------------------------------------------------------------------------
+# Audit log: mode 600, sanitized, never a secret
+# ---------------------------------------------------------------------------
+# bf_log_sanitize -- single choke point before anything reaches the log file.
+bf_log_sanitize() {
+    sed -E \
+        -e 's/((password|passwd|passphrase|secret|token|api[_-]?key|private[_-]?key|preshared[_-]?key|psk|credential)[A-Za-z0-9_.-]*[[:space:]]*[=:])[^[:space:]]+/\1<redacted>/Ig' \
+        -e 's/(BEGIN [A-Z ]*PRIVATE KEY).*/\1 <redacted>/g'
+}
+
+bf_log() {
+    local level="$1"; shift
+    [[ "$BF_LOG_READY" -eq 1 ]] || return 0
+    printf '%s [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$level" "$(printf '%s' "$*" | bf_log_sanitize)" >>"$BF_LOG_FILE"
+}
+
+# bf_log_init -- keep the log at mode 600 or refuse to log into an insecure
+# path. Falls back to a per-user state directory when /var/log is not writable.
+bf_log_init() {
+    local fallback_dir candidate
+    fallback_dir="${XDG_STATE_HOME:-$HOME/.local/state}/blueforce"
+    for candidate in "$BF_LOG_FILE" "$fallback_dir/blueforce-console.log"; do
+        [[ -n "$candidate" ]] || continue
+        if [[ -e "$candidate" ]]; then
+            [[ -w "$candidate" ]] || continue
+        else
+            mkdir -p "$(dirname "$candidate")" 2>/dev/null || continue
+            [[ -w "$(dirname "$candidate")" ]] || continue
+        fi
+        if [[ -e "$candidate" ]]; then
+            chmod 600 "$candidate" 2>/dev/null || continue
+        else
+            ( umask 077; : >"$candidate" ) 2>/dev/null || continue
+            chmod 600 "$candidate" 2>/dev/null || continue
+        fi
+        BF_LOG_FILE="$candidate"
+        BF_LOG_READY=1
+        if [[ "$candidate" != "${BF_LOG_REQUESTED:-$DEFAULT_LOG_FILE}" ]]; then
+            printf '[WARN] %s is not writable; logging to %s instead (mode 600).\n' \
+                "${BF_LOG_REQUESTED:-$DEFAULT_LOG_FILE}" "$candidate" >&2
+        fi
+        return 0
+    done
+    BF_LOG_READY=0
+    printf '[WARN] no writable audit log found; this session will not be logged.\n' >&2
+    return 0
+}
+
+bf_cleanup() {
+    if [[ -n "$BF_INVENTORY_CACHE_FILE" && -f "$BF_INVENTORY_CACHE_FILE" ]]; then
+        rm -f "$BF_INVENTORY_CACHE_FILE"
+    fi
+}
+
+bf_quit() {
+    local code="${1:-0}"
+    tui_note "Leaving the Blueforce console."
+    exit "$code"
+}
+
+# ---------------------------------------------------------------------------
+# Runtime checks with explanations instead of guesses
+# ---------------------------------------------------------------------------
+bf_have_ansible() {
+    command -v ansible-playbook >/dev/null 2>&1
+}
+
+bf_require_ansible() {
+    if bf_have_ansible; then
+        return 0
+    fi
+    tui_error "ansible-playbook was not found on this machine; fleet operations cannot run."
+    tui_note  "The console does not emulate Ansible: it drives the repository's playbooks (docs/09)."
+    tui_note  "Install it on the admin machine, e.g.:"
+    tui_note  "  sudo apt install ansible        # or: pipx install ansible-core"
+    return 1
+}
+
+bf_require_inventory() {
+    local resolved
+    # stdout carries the resolved path, stderr carries the explanation: never
+    # merge them, or an error message would end up inside the path.
+    if resolved="$(bf_inventory_resolve)"; then
+        BF_INVENTORY="$resolved"
+        export BF_INVENTORY
+        return 0
+    fi
+    return 1
+}
+
+bf_require_root() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        return 0
+    fi
+    tui_error "This operation needs root on THIS device."
+    tui_note  "Re-run the console with sudo:  sudo $BF_MENU_NAME"
+    return 1
+}
+
+# bf_tool_path NAME -> preferred path of a diagnostics/maintenance tool.
+# A tool installed under /usr/local/bin wins (that is the canonical Field OS
+# location); otherwise the copy in this checkout is used.
+bf_tool_path() {
+    local name="$1"
+    local sys="/usr/local/bin/$name"
+    local repo="$BF_REPO/scripts/diagnostics/$name"
+    local maint="$BF_REPO/scripts/maintenance/$name"
+    if [[ -x "$sys" ]]; then printf '%s\n' "$sys"; return 0; fi
+    if [[ -x "$repo" ]]; then printf '%s\n' "$repo"; return 0; fi
+    if [[ -x "$maint" ]]; then printf '%s\n' "$maint"; return 0; fi
+    return 1
+}
+
+bf_installer_path() {
+    local p="$BF_REPO/$INSTALLER_REL"
+    [[ -f "$p" ]] && printf '%s\n' "$p"
+}
+
+# ---------------------------------------------------------------------------
+# Execution
+# ---------------------------------------------------------------------------
+# bf_cmd_string -- the command as a copy/pasteable shell line.
+bf_cmd_string() {
+    printf '%q ' "${BF_CMD[@]}"
+}
+
+# bf_exec -- run BF_CMD (or print it under --dry-run). Sets BF_LAST_RC.
+bf_exec() {
+    local printable rc=0
+    printable="$(bf_cmd_string)"
+    printf '\n'
+    tui_section "Command"
+    printf '   %s\n\n' "$printable"
+    if [[ "$BF_DRY_RUN" -eq 1 ]]; then
+        tui_warn "dry-run: the command above was NOT executed."
+        bf_log "DRYRUN" "$printable"
+        BF_LAST_RC=0
+        return 0
+    fi
+    bf_log "RUN" "$printable"
+    set +e
+    "${BF_CMD[@]}"
+    rc=$?
+    set -e
+    BF_LAST_RC="$rc"
+    if [[ "$rc" -eq 0 ]]; then
+        tui_ok "Command finished successfully (exit 0)."
+        bf_log "OK" "exit=0 :: $printable"
+    else
+        tui_error "Command failed with exit $rc."
+        bf_log "FAIL" "exit=$rc :: $printable"
+    fi
+    return 0
+}
+
+# bf_confirm_and_exec LABEL DESTRUCTIVE
+# Shows the command, asks for confirmation, then runs it. Returns 0 when the
+# command was executed (including a confirmed --check run), 1 when cancelled.
+bf_confirm_and_exec() {
+    local label="$1" destructive="${2:-no}" answer=0
+    if [[ "$BF_DRY_RUN" -eq 1 ]]; then
+        bf_exec
+        return 0
+    fi
+    if [[ "$destructive" == "yes" ]]; then
+        tui_warn "State-changing operation: $label"
+        tui_warn "Read the command above before confirming; it changes the selected target(s)."
+        tui_ask_run "Proceed? " || answer=$?
+    else
+        tui_ask_run "Run this command?" || answer=$?
+    fi
+    case "$answer" in
+        0) : ;;
+        2)
+            BF_CMD+=(--check)
+            tui_info "check mode: the command runs with --check and applies no change."
+            ;;
+        *)
+            tui_info "Cancelled; nothing was run."
+            bf_log "CANCEL" "aborted by operator :: $(bf_cmd_string)"
+            return 1
+            ;;
+    esac
+    bf_exec
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Operation catalogue
+# ---------------------------------------------------------------------------
+# Fields: id|label|playbook|scope|destructive|prompt|description
+#   scope       simple | wave | release   (cross-checked against the playbook)
+#   destructive yes|no                    (second confirmation)
+#   prompt      none | packages | service | script | grace | disk_pct |
+#               log_lines | expected_version
+BF_OPS_REPORT=(
+    "ping|Ping / reachability|bf-ping.yml|simple|no|none|SSH reachability check (read-only)"
+    "uptime|Uptime|bf-uptime.yml|simple|no|none|Uptime and load (read-only)"
+    "disk|Disk usage|bf-disk-check.yml|simple|no|disk_pct|Disk usage, warns above a threshold"
+    "docker|Docker status|bf-docker-status.yml|simple|no|none|Docker daemon and containers (read-only)"
+    "packages|Package versions|bf-package-check.yml|simple|no|none|Installed versions of pinned packages"
+    "security-updates|Pending security updates|bf-security-updates-check.yml|simple|no|none|Report only, never installs"
+    "provisioning-status|Provisioning phase report|bf-provisioning-status.yml|wave|no|none|state.json phase per device"
+    "enrollment-status|Enrollment + central evidence|bf-enrollment-status.yml|wave|no|none|ENROLLED/READY claims vs central proof"
+    "fieldos-version|Field OS version report|bf-fieldos-version.yml|wave|no|expected_version|Version per device, optional drift check"
+    "remote-channels|Remote access channels|bf-remote-channels-check.yml|wave|no|none|SSH/xRDP/RustDesk/WireGuard readiness"
+    "offline-ready|Offline readiness report|bf-offline-ready-check.yml|wave|no|none|Local preconditions for offline provisioning"
+)
+
+BF_OPS_MAINTENANCE=(
+    "rdp-restart|Restart RDP|bf-rdp-restart.yml|simple|yes|none|Restart xrdp"
+    "rustdesk-restart|Restart RustDesk|bf-rustdesk-restart.yml|simple|yes|none|Restart the RustDesk service"
+    "wireguard-restart|Restart WireGuard|bf-wireguard-restart.yml|simple|yes|none|Restart wg-quick@wg0"
+    "service-restart|Restart an allowlisted service|bf-service-restart.yml|simple|yes|service|Allowlisted service names only"
+    "gui-off|GUI off (headless)|bf-gui-off.yml|wave|yes|none|Switch the wave to multi-user.target"
+    "gui-on|GUI on (maintenance)|bf-gui-on.yml|wave|yes|none|Start the graphical session again"
+    "collect-logs|Collect logs / support bundle|bf-collect-logs.yml|wave|no|log_lines|Timestamped journal + snapshot bundle"
+    "run-script|Run an approved script|bf-run-script.yml|wave|yes|script|Only /opt/blueforce/bin and /usr/local/sbin"
+    "reboot|Controlled reboot|bf-reboot.yml|release|yes|grace|Serial reboots with a health gate"
+    "deploy-update|Deploy approved package update|bf-deploy-update.yml|release|yes|packages|Pinned package=version, health-gated"
+)
+
+bf_op_field() {
+    local row="$1" field="$2"
+    printf '%s' "$row" | awk -F'|' -v n="$field" '{print $n}'
+}
+
+# ---------------------------------------------------------------------------
+# Playbook helpers: the playbook file stays the source of truth for its gates
+# ---------------------------------------------------------------------------
+# bf_playbook_var_present PLAYBOOK VAR -- true when VAR is used outside comments.
+bf_playbook_var_present() {
+    local pb="$1" var="$2" file="$BF_REPO/$PLAYBOOK_DIR_REL/$1"
+    [[ -r "$file" ]] || return 1
+    grep -vE '^[[:space:]]*#' "$file" | grep -qE "\\b${var}\\b"
+}
+
+# bf_playbook_scope PLAYBOOK -> wave|release|simple, derived from the playbook.
+bf_playbook_scope() {
+    local pb="$1"
+    if bf_playbook_var_present "$pb" release_wave; then
+        printf 'release\n'
+        return 0
+    fi
+    if bf_playbook_var_present "$pb" operation_wave; then
+        printf 'wave\n'
+        return 0
+    fi
+    printf 'simple\n'
+}
+
+# bf_playbook_check PLAYBOOK DECLARED_SCOPE -- existence plus a metadata
+# cross-check, so a console table that drifted from the playbook can never
+# silently drop a wave gate.
+bf_playbook_check() {
+    local pb="$1" declared="$2" file="$BF_REPO/$PLAYBOOK_DIR_REL/$1" actual
+    if [[ ! -r "$file" ]]; then
+        tui_error "Playbook not found: ansible/playbooks/$pb"
+        tui_note  "Expected at: $file"
+        tui_note  "Set --repo to the repository checkout that contains it."
+        return 1
+    fi
+    actual="$(bf_playbook_scope "$pb")"
+    if [[ "$actual" != "$declared" ]]; then
+        tui_error "Refusing to run $pb: the console expects scope '$declared' but the playbook declares '$actual'."
+        tui_note  "The playbook is the source of truth for its gates; update admin/bf-menu before using it."
+        return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Extra -e variables, validated with the same rules the playbooks enforce
+# ---------------------------------------------------------------------------
+BF_SERVICE_ALLOWLIST=(blueforce-agent docker ssh sshd systemd-journald cron)
+BF_SCRIPT_DIRS=(/opt/blueforce/bin /usr/local/sbin)
+
+bf_prompt_extra() {
+    local kind="$1"
+    BF_EXTRA=()
+    case "$kind" in
+        none) return 0 ;;
+        packages) bf_prompt_packages ;;
+        service) bf_prompt_service ;;
+        script) bf_prompt_script ;;
+        grace) bf_prompt_grace ;;
+        disk_pct) bf_prompt_disk_pct ;;
+        log_lines) bf_prompt_log_lines ;;
+        expected_version) bf_prompt_expected_version ;;
+        *) tui_error "Console bug: unknown prompt kind '$kind'."; return 1 ;;
+    esac
+}
+
+bf_prompt_packages() {
+    local pins=() pin array=()
+    tui_note "Exact pins only: package=version (the playbook refuses ranges, 'latest' and empty lists)."
+    tui_prompt "Packages (comma separated)" "" || return 1
+    if [[ -z "$TUI_REPLY" ]]; then
+        tui_error "At least one pinned package is required."
+        return 1
+    fi
+    IFS=',' read -r -a pins <<<"$TUI_REPLY"
+    for pin in "${pins[@]}"; do
+        pin="${pin#"${pin%%[![:space:]]*}"}"
+        pin="${pin%"${pin##*[![:space:]]}"}"
+        [[ -n "$pin" ]] || continue
+        if [[ ! "$pin" =~ ^[A-Za-z0-9][A-Za-z0-9+_.:-]*=.+$ ]]; then
+            tui_error "Invalid pin '$pin': expected package=version (e.g. docker-ce=5:27.0.3-1~ubuntu.24.04~noble)."
+            return 1
+        fi
+        array+=("\"$pin\"")
+    done
+    [[ ${#array[@]} -gt 0 ]] || { tui_error "No usable package pin was given."; return 1; }
+    BF_EXTRA=(-e "update_packages=[$(IFS=,; printf '%s' "${array[*]}")]")
+    return 0
+}
+
+bf_prompt_service() {
+    local name
+    tui_note "Allowlist: ${BF_SERVICE_ALLOWLIST[*]}"
+    tui_prompt "Service name" "" || return 1
+    name="$TUI_REPLY"
+    for allowed in "${BF_SERVICE_ALLOWLIST[@]}"; do
+        if [[ "$name" == "$allowed" ]]; then
+            BF_EXTRA=(-e "service_name=$name")
+            return 0
+        fi
+    done
+    tui_error "Refusing '$name': not in the service allowlist (the playbook would fail closed anyway)."
+    return 1
+}
+
+bf_prompt_script() {
+    local path args dir ok=0
+    tui_note "Allowed directories: ${BF_SCRIPT_DIRS[*]}"
+    tui_prompt "Script path" "" || return 1
+    path="$TUI_REPLY"
+    if [[ "$path" != /* ]]; then
+        tui_error "Script path must be absolute."
+        return 1
+    fi
+    for dir in "${BF_SCRIPT_DIRS[@]}"; do
+        [[ "$path" == "$dir"/* ]] && ok=1
+    done
+    if [[ "$ok" -ne 1 ]]; then
+        tui_error "Refusing '$path': outside the approved directories (the playbook would refuse it too)."
+        return 1
+    fi
+    tui_prompt "Script arguments (optional)" "" || return 1
+    args="$TUI_REPLY"
+    BF_EXTRA=(-e "script_path=$path")
+    if [[ -n "$args" ]]; then
+        BF_EXTRA+=(-e "script_args=$args")
+    fi
+    return 0
+}
+
+bf_prompt_grace() {
+    local seconds
+    tui_prompt "Reboot grace period in seconds" "300" || return 1
+    seconds="$TUI_REPLY"
+    if [[ ! "$seconds" =~ ^[0-9]+$ || "$seconds" -lt 0 ]]; then
+        tui_error "Grace period must be a whole number of seconds."
+        return 1
+    fi
+    BF_EXTRA=(-e "reboot_grace_seconds=$seconds")
+    return 0
+}
+
+bf_prompt_disk_pct() {
+    local pct
+    tui_prompt "Warn above percent (blank = playbook default 80)" "" || return 1
+    pct="$TUI_REPLY"
+    if [[ -z "$pct" ]]; then
+        return 0
+    fi
+    if [[ ! "$pct" =~ ^[0-9]+$ || "$pct" -lt 1 || "$pct" -gt 100 ]]; then
+        tui_error "Threshold must be between 1 and 100."
+        return 1
+    fi
+    BF_EXTRA=(-e "disk_warn_pct=$pct")
+    return 0
+}
+
+bf_prompt_log_lines() {
+    local lines
+    tui_prompt "Journal lines per device" "500" || return 1
+    lines="$TUI_REPLY"
+    if [[ ! "$lines" =~ ^[0-9]+$ || "$lines" -lt 1 ]]; then
+        tui_error "Line count must be a positive whole number."
+        return 1
+    fi
+    BF_EXTRA=(-e "log_lines=$lines")
+    return 0
+}
+
+bf_prompt_expected_version() {
+    local version
+    tui_prompt "Expected Field OS version (blank = no drift check)" "" || return 1
+    version="$TUI_REPLY"
+    if [[ -z "$version" ]]; then
+        return 0
+    fi
+    BF_EXTRA=(-e "fieldos_expected_version=$version")
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Ansible command construction
+# ---------------------------------------------------------------------------
+bf_build_ansible_cmd() {
+    local pb="$1" scope="$2" wave="${3:-}" gate_confirmed="${4:-no}"
+    # Single choke point: no playbook command is ever built without a target.
+    if ! bf_target_is_set; then
+        return 1
+    fi
+    BF_CMD=(ansible-playbook -i "$BF_INVENTORY" "$BF_REPO/$PLAYBOOK_DIR_REL/$pb" --limit "$BF_TARGET_LIMIT")
+    case "$scope" in
+        wave)
+            BF_CMD+=(-e "operation_wave=$wave" -e operation_confirmed=true)
+            if [[ "$wave" == "production" ]]; then
+                if bf_playbook_var_present "$pb" production_override; then
+                    BF_CMD+=(-e production_override=true)
+                fi
+            fi
+            ;;
+        release)
+            BF_CMD+=(-e "release_wave=$wave")
+            if [[ "$gate_confirmed" == "yes" ]] && bf_playbook_var_present "$pb" wave_gate_confirmed; then
+                BF_CMD+=(-e wave_gate_confirmed=true)
+            fi
+            if bf_playbook_var_present "$pb" reboot_confirmed; then
+                BF_CMD+=(-e reboot_confirmed=true)
+            fi
+            if [[ "$wave" == "production" ]]; then
+                if bf_playbook_var_present "$pb" production_override; then
+                    BF_CMD+=(-e production_override=true)
+                fi
+                if bf_playbook_var_present "$pb" allow_production_reboot; then
+                    BF_CMD+=(-e allow_production_reboot=true)
+                fi
+            fi
+            ;;
+    esac
+    if [[ ${#BF_EXTRA[@]} -gt 0 ]]; then
+        BF_CMD+=("${BF_EXTRA[@]}")
+    fi
+    return 0
+}
+
+# bf_confirm_wave_gate WAVE PLAYBOOK -- reproduce the playbook's own gate
+# contract as an explicit operator statement. Nothing is auto-confirmed.
+bf_confirm_wave_gate() {
+    local wave="$1" pb="$2"
+    if [[ "$wave" != "production" ]]; then
+        return 0
+    fi
+    tui_warn "Wave 'production' is the live fleet: $pb refuses to run without an explicit production override."
+    if ! tui_confirm_token "Type production to confirm a PRODUCTION run." "production"; then
+        tui_info "Production confirmation not given."
+        return 1
+    fi
+    return 0
+}
+
+bf_confirm_release_gate() {
+    local pb="$1"
+    if ! bf_playbook_var_present "$pb" wave_gate_confirmed; then
+        return 0
+    fi
+    tui_warn "$pb refuses to run unless the wave gate is confirmed."
+    tui_warn "Confirm only after the previous wave's health gate and the central approval have passed (docs/10)."
+    if ! tui_confirm_token "Wave gate confirmation." "GATE"; then
+        tui_info "Wave gate not confirmed."
+        return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# The device-operation runner
+# ---------------------------------------------------------------------------
+# bf_show_operation_header ROW -- always show what is about to happen.
+bf_show_operation_header() {
+    local row="$1"
+    tui_kv "Operation" "$(bf_op_field "$row" 2)"
+    tui_kv "Playbook" "ansible/playbooks/$(bf_op_field "$row" 3)"
+    tui_kv "Scope" "$(bf_op_field "$row" 4)"
+    tui_kv "Inventory" "${BF_INVENTORY:-unresolved}"
+    tui_kv "Target" "${BF_TARGET_LABEL:-unset}"
+    if [[ -n "${BF_TARGET_WAVE:-}" ]]; then
+        tui_kv "Wave" "$BF_TARGET_WAVE"
+    fi
+    printf '\n'
+}
+
+# bf_run_wave_once ROW WAVE -- build, confirm and run one wave.
+bf_run_wave_once() {
+    local row="$1" wave="$2" pb="$3" destructive="$4" gate="no" scope
+    scope="$(bf_op_field "$row" 4)"
+    # The production token only applies where the playbook actually carries a
+    # wave/release gate; a simple playbook on a production device does not.
+    if [[ "$scope" != "simple" ]] && ! bf_confirm_wave_gate "$wave" "$pb"; then
+        return 1
+    fi
+    if ! bf_confirm_release_gate "$pb"; then
+        return 1
+    fi
+    if bf_playbook_var_present "$pb" wave_gate_confirmed; then
+        gate="yes"
+    fi
+    if ! bf_build_ansible_cmd "$pb" "$(bf_op_field "$row" 4)" "$wave" "$gate"; then
+        tui_error "No target is selected; refusing to build a command."
+        return 1
+    fi
+    printf '\n'
+    tui_section "Command"
+    printf '   %s\n\n' "$(bf_cmd_string)"
+    # Fleet-wide scope is the one selection that can hurt many devices at once:
+    # it needs its own explicit confirmation, not just the run prompt.
+    if [[ "${BF_TARGET_KIND:-}" == "all" ]]; then
+        tui_warn "FLEET-WIDE: this command targets every device in the inventory (${BF_TARGET_COUNT} device(s))."
+        if ! tui_confirm_token "Fleet-wide scope confirmation." "all"; then
+            tui_info "Fleet-wide confirmation not given."
+            bf_log "CANCEL" "fleet-wide confirmation withheld :: $(bf_cmd_string)"
+            return 1
+        fi
+    fi
+    bf_confirm_and_exec "$(bf_op_field "$row" 2) on wave '$wave'" "$destructive" || return 1
+    return 0
+}
+
+# bf_run_row ROW -- full flow: target selection, extra vars, execution.
+bf_run_row() {
+    local row="$1" id pb declared scope prompt destructive mode wave count
+    id="$(bf_op_field "$row" 1)"
+    pb="$(bf_op_field "$row" 3)"
+    declared="$(bf_op_field "$row" 4)"
+    destructive="$(bf_op_field "$row" 5)"
+    prompt="$(bf_op_field "$row" 6)"
+
+    bf_require_ansible || return 1
+    bf_require_inventory || return 1
+    bf_playbook_check "$pb" "$declared" || return 1
+    scope="$declared"
+
+    case "$scope" in
+        wave) mode="wave" ;;
+        release) mode="release" ;;
+        *) mode="any" ;;
+    esac
+
+    tui_screen "$(bf_op_field "$row" 2)" "$(bf_op_field "$row" 7)"
+    tui_note "Choose the target: dealer number, group, or all."
+    if [[ "$scope" == "release" ]]; then
+        tui_note "Release-gated playbooks accept one approved wave, never a single device."
+    fi
+    printf '\n'
+    if ! bf_target_select "$mode"; then
+        return 0
+    fi
+
+    if ! bf_prompt_extra "$prompt"; then
+        tui_warn "No command was built."
+        tui_pause
+        return 0
+    fi
+    bf_log "TARGET" "$id target=${BF_TARGET_LIMIT} kind=${BF_TARGET_KIND} wave=${BF_TARGET_WAVE:-none}"
+
+    if [[ "$scope" == "wave" && "$BF_TARGET_KIND" == "all" ]]; then
+        tui_screen "$(bf_op_field "$row" 2)" "wave by wave, stops at the first failure"
+        tui_warn "This playbook is wave-scoped: the fleet is processed one wave at a time."
+        tui_warn "Order: $(bf_waves_csv | tr ',' ' '). Each wave is shown and confirmed separately."
+        printf '\n'
+        if ! tui_confirm "Start with the first wave?"; then
+            tui_info "Cancelled; nothing was run."
+            return 0
+        fi
+        # An array, not `while read < <(...)`: a redirection on a loop would also
+        # hijack the stdin that the confirmation prompts read from.
+        local waves=()
+        mapfile -t waves < <(bf_wave_groups_present || true)
+        for wave in "${waves[@]}"; do
+            [[ -n "$wave" ]] || continue
+            count="$(bf_count_lines "$(bf_inventory_hosts_of_group "$wave" || true)")"
+            tui_screen "$(bf_op_field "$row" 2)" "wave $wave -- $count device(s)"
+            if ! tui_confirm_token "About to run on wave '$wave' ($count device(s))." "$wave"; then
+                tui_info "Wave '$wave' skipped by the operator."
+                tui_pause
+                continue
+            fi
+            BF_TARGET_KIND="group"
+            BF_TARGET_LIMIT="$wave"
+            BF_TARGET_WAVE="$wave"
+            BF_TARGET_COUNT="$count"
+            BF_TARGET_LABEL="wave '$wave' ($count device(s))"
+            if ! bf_run_wave_once "$row" "$wave" "$pb" "$destructive"; then
+                tui_error "Wave '$wave' did not run to completion; stopping the sequence (no later wave is touched)."
+                bf_log "STOP" "$id stopped after wave=$wave"
+                tui_pause
+                return 1
+            fi
+            if [[ "$BF_LAST_RC" -ne 0 ]]; then
+                tui_error "Wave '$wave' failed (exit $BF_LAST_RC); stopping the sequence."
+                bf_log "STOP" "$id failed at wave=$wave"
+                tui_pause
+                return 1
+            fi
+            tui_pause
+        done
+        return 0
+    fi
+
+    wave="${BF_TARGET_WAVE:-}"
+    if [[ "$scope" == "wave" && -z "$wave" ]]; then
+        tui_error "This playbook is wave-scoped but the target carries no approved wave."
+        tui_note  "Pick a wave group (or a device that belongs to one)."
+        tui_pause
+        return 1
+    fi
+    if [[ "$scope" == "release" && -z "$wave" ]]; then
+        tui_error "Release-gated playbooks need an approved wave group as the target."
+        tui_pause
+        return 1
+    fi
+
+    tui_screen "$(bf_op_field "$row" 2)" "$(bf_op_field "$row" 7)"
+    bf_show_operation_header "$row"
+    bf_run_wave_once "$row" "$wave" "$pb" "$destructive" || return 0
+    tui_pause
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Local (on this device) command runner
+# ---------------------------------------------------------------------------
+# bf_local LABEL DESTRUCTIVE -- cmd... : show, confirm, run a local command.
+bf_local() {
+    local label="$1" destructive="$2"
+    shift 2
+    BF_CMD=("$@")
+    printf '\n'
+    tui_section "$label"
+    bf_confirm_and_exec "$label" "$destructive" || return 1
+    return 0
+}
+
+# bf_show_local_cmd LABEL -- cmd... : run a read-only command without ceremony.
+# The command is passed as arguments; when it is omitted, the caller's BF_CMD is
+# used as-is (defensive: an accidental empty argument list must not erase it).
+bf_show_local_cmd() {
+    local label="$1"
+    shift
+    if [[ $# -gt 0 ]]; then
+        BF_CMD=("$@")
+    fi
+    printf '\n'
+    tui_section "$label"
+    printf '   %s\n\n' "$(bf_cmd_string)"
+    if [[ "$BF_DRY_RUN" -eq 1 ]]; then
+        tui_warn "dry-run: the command above was NOT executed."
+        return 0
+    fi
+    bf_log "RUN" "$(bf_cmd_string)"
+    set +e
+    "${BF_CMD[@]}"
+    BF_LAST_RC=$?
+    set -e
+    if [[ "$BF_LAST_RC" -eq 0 ]]; then
+        bf_log "OK" "exit=0 :: $(bf_cmd_string)"
+    else
+        tui_warn "Command exited with $BF_LAST_RC."
+        bf_log "FAIL" "exit=$BF_LAST_RC :: $(bf_cmd_string)"
+    fi
+    return 0
+}
+
+# bf_run_tool NAME [ARGS...] -- run a diagnostics tool from the preferred path.
+bf_run_tool() {
+    local name="$1"
+    shift
+    local path
+    if ! path="$(bf_tool_path "$name")"; then
+        tui_warn "$name is not available (neither /usr/local/bin/$name nor the checkout copy)."
+        tui_note "Install it from this checkout: sudo install -m 0755 scripts/diagnostics/$name /usr/local/bin/$name"
+        return 1
+    fi
+    bf_show_local_cmd "$name" "$path" "$@"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Category 1 -- local installation of THIS device
+# ---------------------------------------------------------------------------
+bf_installer_or_error() {
+    local path
+    if ! path="$(bf_installer_path)"; then
+        tui_error "Installer not found: $INSTALLER_REL"
+        tui_note  "Set --repo to the checkout that contains it, or clone the repository first:"
+        tui_note  "  git clone <repository-url> Blueforce-Linux && cd Blueforce-Linux"
+        return 1
+    fi
+    printf '%s\n' "$path"
+}
+
+bf_cat_install() {
+    local installer choice dealer offline=0 resume=0
+    while true; do
+        tui_screen "1) Installation (this device)" "Local install only -- no fleet device is touched here"
+        tui_item 1 "Pre-flight check" "installer --check, writes nothing"
+        tui_item 2 "Install this device" "full run, asks dealer number"
+        tui_item 3 "Resume after a failed run" "installer --resume"
+        tui_item 4 "Run a single module" "installer --only"
+        tui_item 5 "Show module state" "/var/lib/blueforce/install-state"
+        tui_item 6 "Show the installer log" "tail of /var/log/blueforce-install.log"
+        tui_footer
+        if ! tui_read "Choice > "; then bf_quit; fi
+        choice="$TUI_REPLY"
+        case "$choice" in
+            0) return 0 ;;
+            q|Q) bf_quit ;;
+            1)
+                installer="$(bf_installer_or_error)" || { tui_pause; continue; }
+                tui_note "Read-only pre-flight: the installer creates no log, state or directory in --check mode."
+                tui_read "Dealer number (8 digits) > " || bf_quit
+                dealer="$TUI_REPLY"
+                if ! bf_dealer_validate "$dealer"; then
+                    tui_error "Invalid dealer number '$dealer': it must match ${BF_DEALER_RE}."
+                    tui_pause; continue
+                fi
+                BF_CMD=(bash "$installer" --dealer-id "$dealer" --check)
+                bf_show_local_cmd "Pre-flight check for $(bf_dealer_to_device_id "$dealer")" "${BF_CMD[@]}"
+                tui_pause
+                ;;
+            2|3|4)
+                installer="$(bf_installer_or_error)" || { tui_pause; continue; }
+                bf_require_root || { tui_pause; continue; }
+                printf '\n'
+                tui_read "Dealer number (8 digits) > " || bf_quit
+                dealer="$TUI_REPLY"
+                if ! bf_dealer_validate "$dealer"; then
+                    tui_error "Invalid dealer number '$dealer': it must match ${BF_DEALER_RE}."
+                    tui_pause; continue
+                fi
+                offline=0 resume=0
+                if [[ "$choice" == "3" ]]; then
+                    resume=1
+                else
+                    if tui_confirm "Install from the local offline repository (--offline)?"; then
+                        offline=1
+                    fi
+                    if [[ "$choice" == "2" ]] && tui_confirm "Resume: skip modules already recorded as OK?"; then
+                        resume=1
+                    fi
+                fi
+                BF_CMD=(bash "$installer" --dealer-id "$dealer")
+                [[ "$offline" -eq 1 ]] && BF_CMD+=(--offline)
+                [[ "$resume" -eq 1 ]] && BF_CMD+=(--resume)
+                if [[ "$choice" == "4" ]]; then
+                    bf_pick_module "$installer" || { tui_pause; continue; }
+                fi
+                printf '\n'
+                tui_info "Target device: $(bf_dealer_to_device_id "$dealer") ($(bf_dealer_to_host "$dealer"))"
+                bf_confirm_and_exec "install on $(bf_dealer_to_device_id "$dealer")" "yes" || true
+                tui_pause
+                ;;
+            5)
+                BF_CMD=(cat /var/lib/blueforce/install-state)
+                bf_show_local_cmd "Installer module state" "${BF_CMD[@]}"
+                tui_pause
+                ;;
+            6)
+                BF_CMD=(tail -n 40 /var/log/blueforce-install.log)
+                bf_show_local_cmd "Installer log (last 40 lines)" "${BF_CMD[@]}"
+                tui_pause
+                ;;
+            *) tui_error "Unknown choice '$choice'."; tui_pause ;;
+        esac
+    done
+}
+
+# bf_pick_module INSTALLER -- choose one installer module and append --only.
+bf_pick_module() {
+    local installer="$1" dir index=0 name choice i=0 pick="" modules=()
+    dir="$BF_REPO/scripts/install/installer/modules"
+    if [[ ! -d "$dir" ]]; then
+        tui_error "Module directory not found: $dir"
+        return 1
+    fi
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        modules+=("$name")
+    done < <(find "$dir" -maxdepth 1 -type f -name '[0-9][0-9]-*.sh' -printf '%f\n' 2>/dev/null | sort)
+    if [[ ${#modules[@]} -eq 0 ]]; then
+        tui_error "No installer modules found under $dir"
+        return 1
+    fi
+    printf '\n'
+    for name in "${modules[@]}"; do
+        index=$((index + 1))
+        tui_item "$index" "${name%.sh}" ""
+    done
+    tui_footer "Cancel the module selection"
+    printf '\n'
+    tui_read "Module number > " || return 1
+    choice="$TUI_REPLY"
+    if ! tui_menu_index "$choice" "${#modules[@]}"; then
+        tui_error "Enter a number between 1 and ${#modules[@]}."
+        return 1
+    fi
+    for name in "${modules[@]}"; do
+        i=$((i + 1))
+        if [[ "$i" -eq "$choice" ]]; then
+            pick="${name%.sh}"
+            break
+        fi
+    done
+    [[ -n "$pick" ]] || return 1
+    BF_CMD+=(--only "$pick")
+    tui_info "Selected module: $pick"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Category 2 -- device operations through Ansible
+# ---------------------------------------------------------------------------
+bf_ops_menu() {
+    local title="$1" subtitle="$2"
+    shift 2
+    local rows=("$@") row index=0 choice
+    while true; do
+        tui_screen "$title" "$subtitle"
+        for row in "${rows[@]}"; do
+            index=$((index + 1))
+            tui_item "$index" "$(bf_op_field "$row" 2)" "$(bf_op_field "$row" 7)"
+        done
+        tui_footer
+        if ! tui_read "Choice > "; then bf_quit; fi
+        choice="$TUI_REPLY"
+        case "$choice" in
+            0) return 0 ;;
+            q|Q) bf_quit ;;
+            *)
+                index=0
+                if tui_menu_index "$choice" "${#rows[@]}"; then
+                    bf_run_row "${rows[$((choice - 1))]}"
+                else
+                    tui_error "Unknown choice '$choice'."
+                    tui_pause
+                fi
+                ;;
+        esac
+        index=0
+    done
+}
+
+bf_cat_devices() {
+    local choice
+    while true; do
+        tui_screen "2) Device operations" "Existing playbooks only, always with an explicit target"
+        if ! bf_have_ansible; then
+            tui_warn "ansible-playbook is not installed on this machine: fleet operations will refuse to run."
+        fi
+        tui_item 1 "Read-only reports" "${#BF_OPS_REPORT[@]} operations, no change on any device"
+        tui_item 2 "Maintenance actions" "${#BF_OPS_MAINTENANCE[@]} operations, some destructive"
+        tui_item 3 "Show inventory targets" "groups, hosts and counts"
+        tui_footer
+        if ! tui_read "Choice > "; then bf_quit; fi
+        choice="$TUI_REPLY"
+        case "$choice" in
+            0) return 0 ;;
+            q|Q) bf_quit ;;
+            1) bf_ops_menu "2.1) Read-only fleet reports" "No playbook in this list changes a device" "${BF_OPS_REPORT[@]}" ;;
+            2) bf_ops_menu "2.2) Fleet maintenance" "Destructive operations ask twice" "${BF_OPS_MAINTENANCE[@]}" ;;
+            3) bf_show_targets; tui_pause ;;
+            *) tui_error "Unknown choice '$choice'."; tui_pause ;;
+        esac
+    done
+}
+
+bf_show_targets() {
+    if ! bf_require_inventory; then
+        return 1
+    fi
+    local group count host waves=() groups=() hosts=()
+    mapfile -t waves < <(bf_wave_groups_present || true)
+    mapfile -t groups < <(bf_inventory_groups || true)
+    mapfile -t hosts < <(bf_inventory_hosts || true)
+    printf '\n'
+    tui_section "Waves (rollout order)"
+    for group in "${waves[@]}"; do
+        [[ -n "$group" ]] || continue
+        count="$(bf_count_lines "$(bf_inventory_hosts_of_group "$group" || true)")"
+        tui_kv "$group" "$count device(s)"
+    done
+    printf '\n'
+    tui_section "Other groups in the inventory"
+    for group in "${groups[@]}"; do
+        [[ -n "$group" ]] || continue
+        bf_is_wave "$group" && continue
+        count="$(bf_count_lines "$(bf_inventory_hosts_of_group "$group" || true)")"
+        tui_kv "$group" "$count device(s)"
+    done
+    printf '\n'
+    tui_section "Devices"
+    for host in "${hosts[@]}"; do
+        [[ -n "$host" ]] || continue
+        printf '   %s\n' "$host"
+    done
+    printf '\n'
+    tui_kv "Inventory" "$BF_INVENTORY"
+    tui_kv "Devices total" "$(bf_inventory_count_all)"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Category 3 -- central side preparation (no central server is installed here)
+# ---------------------------------------------------------------------------
+bf_cat_central() {
+    local choice
+    while true; do
+        tui_screen "3) Central (preparation)" "This console prepares and verifies central integration; it installs no central server"
+        tui_item 1 "Central readiness report" "inventory, placeholders, admin key"
+        tui_item 2 "Show configured central endpoints" "WireGuard hub, monitoring, mirror"
+        tui_item 3 "Probe central endpoints" "DNS + TCP, read-only"
+        tui_item 4 "Wave rollout gate state" "per-wave device counts and gate rules"
+        tui_item 5 "Central preparation checklist" "what must exist before enrollment"
+        tui_footer
+        if ! tui_read "Choice > "; then bf_quit; fi
+        choice="$TUI_REPLY"
+        case "$choice" in
+            0) return 0 ;;
+            q|Q) bf_quit ;;
+            1) bf_central_readiness; tui_pause ;;
+            2) bf_central_endpoints; tui_pause ;;
+            3) bf_central_probe; tui_pause ;;
+            4) bf_wave_gate_state; tui_pause ;;
+            5) bf_central_checklist; tui_pause ;;
+            *) tui_error "Unknown choice '$choice'."; tui_pause ;;
+        esac
+    done
+}
+
+bf_group_vars_path() {
+    local p="$BF_REPO/ansible/inventory/group_vars/all.yml"
+    [[ -r "$p" ]] && printf '%s\n' "$p"
+}
+
+bf_group_vars_value() {
+    local key="$1" file
+    file="$(bf_group_vars_path)" || return 1
+    awk -v k="$key" '
+        $0 ~ "^[[:space:]]*" k "[[:space:]]*:" {
+            sub(/^[^:]*:/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+            gsub(/^["\x27]|["\x27]$/, ""); gsub(/[[:space:]]*#.*$/, ""); print; exit
+        }' "$file"
+}
+
+bf_central_readiness() {
+    local file placeholders keyfile
+    printf '\n'
+    tui_section "Central readiness"
+    if ! bf_require_inventory; then
+        return 1
+    fi
+    tui_ok "Inventory found: $BF_INVENTORY ($(bf_inventory_count_all) device(s))"
+
+    if file="$(bf_group_vars_path)"; then
+        placeholders="$(grep -c 'PLACEHOLDER' "$file" || true)"
+        if [[ "${placeholders:-0}" -gt 0 ]]; then
+            tui_warn "group_vars/all.yml still contains ${placeholders} PLACEHOLDER value(s):"
+            grep -n 'PLACEHOLDER' "$file" | sed 's/^/         /'
+            tui_note "Replace them before a production run; the console refuses nothing here on purpose, it reports."
+        else
+            tui_ok "No PLACEHOLDER left in group_vars/all.yml"
+        fi
+    else
+        tui_warn "ansible/inventory/group_vars/all.yml was not found."
+    fi
+
+    keyfile="${HOME}/.ssh/blueforce_id_ed25519"
+    if [[ -r "$keyfile" ]]; then
+        tui_ok "Admin SSH key present: $keyfile (contents are never read or printed)"
+    else
+        tui_warn "Admin SSH key not found at $keyfile (docs/06)."
+        tui_note "The inventory may point somewhere else: ansible_ssh_private_key_file."
+    fi
+
+    if grep -q 'example' "$BF_INVENTORY" 2>/dev/null || [[ "$BF_INVENTORY" == *example* ]]; then
+        tui_warn "This looks like an example inventory; do not aim it at real devices."
+    fi
+    return 0
+}
+
+bf_central_endpoints() {
+    local key value
+    printf '\n'
+    tui_section "Configured central endpoints"
+    for key in wg_subnet wg_interface wg_hub_endpoint monitoring_endpoint monitoring_job update_repo_url meg_image_tag support_bundle_dir; do
+        value="$(bf_group_vars_value "$key" || true)"
+        if [[ -n "$value" ]]; then
+            tui_kv "$key" "$value"
+        fi
+    done
+    tui_note "Values come from ansible/inventory/group_vars/all.yml; no secret is stored there or printed here."
+    return 0
+}
+
+bf_central_probe() {
+    local endpoint host port resolved
+    printf '\n'
+    tui_section "Central endpoint probe (read-only)"
+    for endpoint in "$(bf_group_vars_value wg_hub_endpoint || true)" "$(bf_group_vars_value monitoring_endpoint || true)" "$(bf_group_vars_value update_repo_url || true)"; do
+        [[ -n "$endpoint" ]] || continue
+        host="${endpoint#*//}"
+        host="${host%%/*}"
+        host="${host%%:*}"
+        port=""
+        if [[ "$endpoint" =~ :([0-9]+)$ ]]; then
+            port="${BASH_REMATCH[1]}"
+        elif [[ "$endpoint" == http://* ]]; then
+            port=80
+        elif [[ "$endpoint" == https://* ]]; then
+            port=443
+        fi
+        if [[ -z "$host" ]]; then
+            continue
+        fi
+        if resolved="$(getent hosts "$host" 2>/dev/null | awk 'NR==1{print $1}')" && [[ -n "$resolved" ]]; then
+            if [[ -n "$port" ]]; then
+                if timeout 3 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
+                    tui_ok "$host:$port reachable (resolves to $resolved)"
+                else
+                    tui_warn "$host:$port not reachable (resolves to $resolved)"
+                fi
+            else
+                tui_ok "$host resolves to $resolved (no port derived from the value)"
+            fi
+        else
+            tui_warn "$host does not resolve -- expected while the placeholder is unfilled"
+        fi
+    done
+    return 0
+}
+
+bf_wave_gate_state() {
+    local wave count
+    printf '\n'
+    tui_section "Wave rollout gate state"
+    if ! bf_require_inventory; then
+        return 1
+    fi
+    if ! bf_inventory_cache; then
+        tui_error "Inventory could not be parsed: $BF_INVENTORY"
+        return 1
+    fi
+    for wave in "${BF_WAVES[@]}"; do
+        if bf_inventory_group_exists "$wave"; then
+            count="$(bf_count_lines "$(bf_inventory_hosts_of_group "$wave" || true)")"
+            tui_kv "$wave" "$count device(s)"
+        else
+            tui_kv "$wave" "absent from the inventory"
+        fi
+    done
+    tui_note "Gate rule: a wave may only start after the previous wave passed its health gate and central approval (docs/10)."
+    tui_note "Production additionally needs the typed 'production' confirmation in this console and its override flag."
+    return 0
+}
+
+bf_central_checklist() {
+    printf '\n'
+    tui_section "Central preparation checklist (informational)"
+    tui_msg "   1. WireGuard hub: endpoint, keys and peer allocation for each bf-<dealer> (docs/08)."
+    tui_msg "   2. Enrollment token service: one-time, TTL-limited tokens (docs/29)."
+    tui_msg "   3. Monitoring: Prometheus/VictoriaMetrics + Grafana, device_id label = BF-<no> (docs/14)."
+    tui_msg "   4. Remote access: RustDesk hbbs/hbbr or MeshCentral reachable over WireGuard (docs/07)."
+    tui_msg "   5. Package mirror + offline snapshot for field installs (docs/10, docs/27)."
+    tui_msg "   6. Ansible inventory with real hostnames and a per-admin SSH key (docs/02, docs/06, docs/09)."
+    tui_note "This console verifies 6 and prepares 1-5; it installs no central component."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Category 4 -- tools
+# ---------------------------------------------------------------------------
+bf_cat_tools() {
+    local choice out_dir
+    while true; do
+        tui_screen "4) Tools" "Local helpers; the ISO build is intentionally not part of this console"
+        tui_section "Repository"
+        tui_item 1 "Update this checkout" "git pull --ff-only"
+        tui_item 2 "Environment and reference info" "paths, versions, resolved settings"
+        tui_item 3 "Show the operation catalogue" "--list output"
+        tui_section "Local device tools"
+        tui_item 4 "Local offline gate" "bf-check-local"
+        tui_item 5 "Enrollment gate" "bf-check-enrollment"
+        tui_item 6 "Ready gate" "bf-check-ready"
+        tui_item 7 "Deep diagnostics" "bf-diagnostics (or bf-status)"
+        tui_item 8 "Live hardware / OS check" "bf-live-hw-check, read-only"
+        tui_item 9 "Remote access channels" "bf-remote-status --check"
+        tui_item 10 "Field OS release identity" "bf-release"
+        tui_item 11 "Hardware inventory" "bf-hardware-inventory.sh"
+        tui_item 12 "Support bundle" "bf-support-bundle --out-dir"
+        tui_section "This console"
+        tui_item 13 "Show the console log" "last 40 lines of the audit log"
+        tui_footer
+        if ! tui_read "Choice > "; then bf_quit; fi
+        choice="$TUI_REPLY"
+        case "$choice" in
+            0) return 0 ;;
+            q|Q) bf_quit ;;
+            1)
+                BF_CMD=(git -C "$BF_REPO" pull --ff-only)
+                if bf_confirm_and_exec "update the checkout at $BF_REPO" "yes"; then
+                    tui_note "The console itself may have changed; restart it after a pull."
+                fi
+                tui_pause
+                ;;
+            2) bf_show_environment; tui_pause ;;
+            3) bf_print_catalogue; tui_pause ;;
+            4) bf_run_tool bf-check-local --check; tui_pause ;;
+            5) bf_run_tool bf-check-enrollment --check; tui_pause ;;
+            6) bf_run_tool bf-check-ready --check; tui_pause ;;
+            7)
+                if ! bf_run_tool bf-diagnostics; then
+                    bf_run_tool bf-status || true
+                fi
+                tui_pause
+                ;;
+            8) bf_run_tool bf-live-hw-check; tui_pause ;;
+            9) bf_run_tool bf-remote-status --check; tui_pause ;;
+            10) bf_run_tool bf-release; tui_pause ;;
+            11)
+                if [[ "$(id -u)" -eq 0 ]]; then
+                    out_dir="/var/lib/blueforce/inventory"
+                else
+                    out_dir="${XDG_STATE_HOME:-$HOME/.local/state}/blueforce/inventory"
+                fi
+                if bf_tool_path bf-hardware-inventory.sh >/dev/null 2>&1; then
+                    tui_prompt "Dealer number (8 digits)" "" || continue
+                    if ! bf_dealer_validate "$TUI_REPLY"; then
+                        tui_error "Invalid dealer number; it must match ${BF_DEALER_RE}."
+                        tui_pause; continue
+                    fi
+                    bf_show_local_cmd "Hardware inventory for $(bf_dealer_to_device_id "$TUI_REPLY")" \
+                        "$(bf_tool_path bf-hardware-inventory.sh)" --dealer-id "$TUI_REPLY" --out-dir "$out_dir"
+                else
+                    tui_warn "bf-hardware-inventory.sh is not available."
+                fi
+                tui_pause
+                ;;
+            12)
+                if bf_tool_path bf-support-bundle >/dev/null 2>&1; then
+                    bf_local "Support bundle" "no" "$(bf_tool_path bf-support-bundle)" --out-dir /var/tmp
+                else
+                    tui_warn "bf-support-bundle is not available."
+                fi
+                tui_pause
+                ;;
+            13)
+                BF_CMD=(tail -n 40 "$BF_LOG_FILE")
+                bf_show_local_cmd "Console log ($BF_LOG_FILE)" "${BF_CMD[@]}"
+                tui_pause
+                ;;
+            *) tui_error "Unknown choice '$choice'."; tui_pause ;;
+        esac
+    done
+}
+
+bf_show_environment() {
+    printf '\n'
+    tui_section "Environment"
+    tui_kv "Console" "$BF_MENU_NAME $BF_MENU_VERSION"
+    tui_kv "Repository" "$BF_REPO"
+    tui_kv "Inventory" "${BF_INVENTORY:-not resolved yet}"
+    tui_kv "Audit log" "$BF_LOG_FILE (mode $(stat -c '%a' "$BF_LOG_FILE" 2>/dev/null || echo '?'))"
+    tui_kv "dry-run" "$([[ "$BF_DRY_RUN" -eq 1 ]] && echo yes || echo no)"
+    tui_kv "Running as" "uid $(id -u) ($(id -un 2>/dev/null || echo unknown))"
+    tui_kv "Ansible" "$(command -v ansible-playbook 2>/dev/null || echo 'not installed')"
+    if bf_have_ansible; then
+        tui_kv "ansible-core" "$(ansible --version 2>/dev/null | awk 'NR==1{print $2}' || echo unknown)"
+    fi
+    tui_kv "Installer" "$(bf_installer_path || echo 'not found')"
+    tui_kv "Playbook dir" "$BF_REPO/$PLAYBOOK_DIR_REL"
+    printf '\n'
+    tui_section "Resolved tool paths"
+    for tool in bf-status bf-diagnostics bf-check-local bf-check-enrollment bf-check-ready bf-release bf-remote-status bf-support-bundle bf-hardware-inventory.sh; do
+        tui_kv "$tool" "$(bf_tool_path "$tool" || echo 'not available')"
+    done
+    return 0
+}
+
+bf_print_catalogue() {
+    local row index
+    printf '\n'
+    tui_section "Category 2.1 -- read-only fleet reports"
+    index=0
+    for row in "${BF_OPS_REPORT[@]}"; do
+        index=$((index + 1))
+        printf '   %2s) %-34s %-36s scope=%-8s destructive=%s\n' "$index" "$(bf_op_field "$row" 1)" \
+            "$(bf_op_field "$row" 3)" "$(bf_op_field "$row" 4)" "$(bf_op_field "$row" 5)"
+    done
+    printf '\n'
+    tui_section "Category 2.2 -- fleet maintenance"
+    index=0
+    for row in "${BF_OPS_MAINTENANCE[@]}"; do
+        index=$((index + 1))
+        printf '   %2s) %-34s %-36s scope=%-8s destructive=%s\n' "$index" "$(bf_op_field "$row" 1)" \
+            "$(bf_op_field "$row" 3)" "$(bf_op_field "$row" 4)" "$(bf_op_field "$row" 5)"
+    done
+    printf '\n'
+    tui_note "scope=wave needs -e operation_wave=<wave> -e operation_confirmed=true (set by this console after confirmation)."
+    tui_note "scope=release needs -e release_wave=<wave> plus the wave gate typed confirmation."
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Category 5 -- device information
+# ---------------------------------------------------------------------------
+bf_cat_info() {
+    local choice
+    while true; do
+        tui_screen "5) Device information" "Read-only: nothing here changes a device"
+        tui_section "This device"
+        tui_item 1 "Identity" "hostname, device id, dealer number"
+        tui_item 2 "Health summary" "bf-status"
+        tui_item 3 "Provisioning and enrollment state" "state.json whitelist + bf-enrollment-status"
+        tui_item 4 "Network" "addresses, route, DNS, WireGuard peers"
+        tui_item 5 "Disk, memory, CPU" "df, free, load"
+        tui_item 6 "Installed pinned packages" "dpkg-query"
+        tui_item 7 "Service status" "ssh, xrdp, rustdesk, docker, wg, meshagent"
+        tui_item 8 "Recent journal errors" "journalctl -p err"
+        tui_section "The fleet"
+        tui_item 9 "Inventory summary" "waves, groups, counts"
+        tui_item 10 "Resolve a target" "check a dealer number or group"
+        tui_footer
+        if ! tui_read "Choice > "; then bf_quit; fi
+        choice="$TUI_REPLY"
+        case "$choice" in
+            0) return 0 ;;
+            q|Q) bf_quit ;;
+            1) bf_info_identity; tui_pause ;;
+            2) bf_run_tool bf-status; tui_pause ;;
+            3) bf_info_state; tui_pause ;;
+            4) bf_info_network; tui_pause ;;
+            5) bf_info_resources; tui_pause ;;
+            6) bf_info_packages; tui_pause ;;
+            7) bf_info_services; tui_pause ;;
+            8) bf_info_journal; tui_pause ;;
+            9) bf_show_targets; tui_pause ;;
+            10) bf_info_resolve_target; tui_pause ;;
+            *) tui_error "Unknown choice '$choice'."; tui_pause ;;
+        esac
+    done
+}
+
+bf_info_identity() {
+    local host dealer device_id
+    host="$(hostname 2>/dev/null || echo unknown)"
+    printf '\n'
+    tui_section "Identity"
+    tui_kv "Hostname (machine)" "$host"
+    if dealer="$(bf_host_to_dealer "$host")"; then
+        tui_kv "Dealer number" "$dealer"
+        tui_kv "Device ID (human)" "$(bf_dealer_to_device_id "$dealer")"
+    else
+        tui_warn "Hostname is not bf-<8 digits>; it does not match the naming standard (docs/02)."
+        tui_note "The installer sets it from --dealer-id: sudo $BF_MENU_NAME -> category 1"
+    fi
+    if [[ -r /var/lib/blueforce/state.json ]]; then
+        device_id="$(bf_state_value device_id || true)"
+        [[ -n "$device_id" ]] && tui_kv "state.json device_id" "$device_id"
+    fi
+    tui_kv "Kernel" "$(uname -sr 2>/dev/null || echo unknown)"
+    tui_kv "Console" "$BF_MENU_NAME $BF_MENU_VERSION"
+    return 0
+}
+
+# bf_state_value KEY -- read one whitelisted key from /var/lib/blueforce/state.json.
+# Only non-secret identity/lifecycle fields are ever extracted: the file is read
+# through a whitelist so a future token field can never leak into the UI or log.
+BF_STATE_ALLOWED_KEYS="phase enrollment_status fleet_status device_id provisioning_id"
+bf_state_value() {
+    local key="$1" state="/var/lib/blueforce/state.json"
+    [[ -r "$state" ]] || return 1
+    [[ " $BF_STATE_ALLOWED_KEYS " == *" $key "* ]] || return 1
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    sys.exit(1)
+if not isinstance(data, dict):
+    sys.exit(1)
+value = data.get(sys.argv[2])
+if value is None or isinstance(value, bool):
+    sys.exit(1)
+sys.stdout.write(str(value) + "\n")
+' "$state" "$key" 2>/dev/null || return 1
+        return 0
+    fi
+    awk -v pattern="\"$key\"" '
+        index($0, pattern) {
+            line = $0
+            sub(/^[^:]*:[[:space:]]*/, "", line)
+            gsub(/^"|"[,]?$/, "", line)
+            print line; exit
+        }' "$state" || return 1
+    return 0
+}
+
+bf_info_state() {
+    local key value
+    printf '\n'
+    tui_section "Provisioning and enrollment state"
+    if [[ -r /var/lib/blueforce/state.json ]]; then
+        for key in phase enrollment_status fleet_status device_id provisioning_id; do
+            value="$(bf_state_value "$key" || true)"
+            [[ -n "$value" ]] && tui_kv "$key" "$value"
+        done
+        tui_note "Only the identity/lifecycle whitelist above is read; tokens and keys are never printed."
+    else
+        tui_warn "/var/lib/blueforce/state.json is missing: the device has not been provisioned by the installer."
+    fi
+    printf '\n'
+    printf '   %sProvisioning : PROVISIONED_OFFLINE -> Enrollment : ENROLLED -> Fleet State : READY%s\n' "$C_DIM" "$C_RESET"
+    tui_note "Forward-only state machine; READY requires verified central evidence (docs/29)."
+    return 0
+}
+
+bf_info_network() {
+    printf '\n'
+    tui_section "Network"
+    if command -v ip >/dev/null 2>&1; then
+        bf_show_local_cmd "Interfaces" ip -brief address
+    fi
+    if command -v ip >/dev/null 2>&1; then
+        bf_show_local_cmd "Default routes" ip route show default
+    fi
+    if [[ -r /etc/resolv.conf ]]; then
+        bf_show_local_cmd "DNS servers (nameserver lines only)" awk '/^nameserver/{print}' /etc/resolv.conf
+    fi
+    if command -v wg >/dev/null 2>&1; then
+        bf_show_local_cmd "WireGuard listen port" wg show wg0 listen-port
+        bf_show_local_cmd "WireGuard peer count" sh -c 'wg show wg0 peers | wc -l'
+        bf_show_local_cmd "WireGuard handshakes (epoch, no keys)" wg show wg0 latest-handshakes
+    else
+        tui_note "wg is not installed; WireGuard channels are not configured on this device."
+    fi
+    tui_note "WireGuard private and preshared keys are never requested, displayed or logged."
+    return 0
+}
+
+bf_info_resources() {
+    printf '\n'
+    tui_section "Resources"
+    bf_show_local_cmd "Filesystems" df -h
+    bf_show_local_cmd "Memory" free -h
+    bf_show_local_cmd "Load average and uptime" uptime
+    return 0
+}
+
+bf_info_packages() {
+    printf '\n'
+    tui_section "Installed versions"
+    if command -v dpkg-query >/dev/null 2>&1; then
+        # shellcheck disable=SC2016  # dpkg field syntax, not a shell expansion
+        bf_show_local_cmd "Pinned packages" dpkg-query -W -f='${Package} ${Version} ${Status}\n' \
+            docker-ce wireguard rustdesk xrdp openssh-server
+    else
+        tui_warn "dpkg-query is not available on this machine."
+    fi
+    return 0
+}
+
+bf_info_services() {
+    printf '\n'
+    tui_section "Service status (read-only)"
+    if ! command -v systemctl >/dev/null 2>&1; then
+        tui_warn "systemctl is not available on this machine."
+        return 0
+    fi
+    bf_show_local_cmd "Units" systemctl is-active ssh sshd xrdp rustdesk docker wg-quick@wg0 meshagent cron
+    return 0
+}
+
+bf_info_journal() {
+    printf '\n'
+    tui_section "Recent journal errors"
+    if command -v journalctl >/dev/null 2>&1; then
+        bf_show_local_cmd "Errors (last 20)" journalctl -p err -n 20 --no-pager
+    else
+        tui_warn "journalctl is not available on this machine."
+    fi
+    return 0
+}
+
+bf_info_resolve_target() {
+    local word mode="any" answer
+    printf '\n'
+    tui_section "Resolve a target"
+    tui_note "Accepts a dealer number, a group name, 'all' or a bf-<dealer> hostname."
+    tui_read "Target > " || return 1
+    word="$TUI_REPLY"
+    if [[ -z "$word" ]]; then
+        return 1
+    fi
+    if ! bf_require_inventory; then
+        return 1
+    fi
+    if tui_confirm "Is this target for a wave-scoped operation?"; then
+        mode="wave"
+    fi
+    answer="$word"
+    if bf_target_parse "$answer" "$mode"; then
+        printf '\n'
+        tui_kv "Kind" "$BF_TARGET_KIND"
+        tui_kv "Ansible --limit" "$BF_TARGET_LIMIT"
+        tui_kv "Wave" "${BF_TARGET_WAVE:-none}"
+        tui_kv "Devices" "$BF_TARGET_COUNT"
+        printf '\n'
+        tui_note "Example: ansible-playbook -i $BF_INVENTORY $BF_REPO/$PLAYBOOK_DIR_REL/bf-ping.yml --limit $BF_TARGET_LIMIT"
+    else
+        tui_warn "That target cannot be used."
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Main menu
+# ---------------------------------------------------------------------------
+bf_main_menu() {
+    local choice
+    while true; do
+        tui_screen "Blueforce operator console $BF_MENU_VERSION" "repo: $BF_REPO"
+        if [[ "$BF_DRY_RUN" -eq 1 ]]; then
+            tui_warn "DRY-RUN MODE: commands are printed, never executed."
+        fi
+        if ! bf_have_ansible; then
+            tui_warn "ansible-playbook not found: categories 2, 3 and 5-fleet need Ansible."
+        fi
+        tui_section "Categories"
+        tui_item 1 "Installation" "this device, local one-click installer"
+        tui_item 2 "Device operations" "fleet playbooks, explicit target"
+        tui_item 3 "Central (preparation)" "verify and prepare central integration"
+        tui_item 4 "Tools" "repository and local helpers"
+        tui_item 5 "Device information" "read-only information screens"
+        printf '\n'
+        tui_hr '-'
+        printf '   %s%2s%s) %s\n' "$C_BOLD" "q" "$C_RESET" "Quit the console"
+        printf '   %sLog:%s %s\n' "$C_DIM" "$C_RESET" "$BF_LOG_FILE"
+        tui_hr '-'
+        if ! tui_read "Choice > "; then bf_quit; fi
+        choice="$TUI_REPLY"
+        case "$choice" in
+            1) bf_cat_install ;;
+            2) bf_cat_devices ;;
+            3) bf_cat_central ;;
+            4) bf_cat_tools ;;
+            5) bf_cat_info ;;
+            q|Q) bf_quit ;;
+            0) tui_note "Already at the top level."; tui_pause ;;
+            *) tui_error "Unknown choice '$choice'."; tui_pause ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+main() {
+    bf_parse_args "$@"
+    BF_LOG_REQUESTED="$BF_LOG_FILE"
+    bf_resolve_repo
+    trap bf_cleanup EXIT
+    # shellcheck source=lib/tui.sh disable=SC1091
+    source "$BF_REPO/admin/lib/tui.sh"
+    tui_init_colors "${TUI_COLOR_MODE:-auto}"
+    # shellcheck source=lib/targets.sh disable=SC1091
+    source "$BF_REPO/admin/lib/targets.sh"
+    bf_log_init
+
+    if [[ "$BF_LIST_TARGETS" -eq 1 ]]; then
+        bf_show_targets
+        exit $?
+    fi
+    if [[ "$BF_LIST" -eq 1 ]]; then
+        bf_print_catalogue
+        exit 0
+    fi
+
+    bf_log "SESSION" "$BF_MENU_NAME $BF_MENU_VERSION start uid=$(id -u) repo=$BF_REPO dry_run=$BF_DRY_RUN"
+    if ! bf_require_inventory; then
+        tui_warn "Starting without a usable inventory: fleet categories will explain what is missing."
+        BF_INVENTORY=""
+    fi
+    bf_main_menu
+}
+
+main "$@"

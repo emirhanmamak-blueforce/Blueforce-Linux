@@ -10,6 +10,32 @@
 
 %100 ücretsiz / self-hosted Linux filo mimarisi: başka bir DevOps mühendisinin sıfırdan kurabileceği doküman setinin ve çalışan iskeletin ana reposu. Dokümanlar Türkçedir; komut, dosya, servis ve terim adları İngilizce kalır.
 
+**Kurulum git tabanlıdır:** depo klonlanır, `admin/bf-bootstrap.sh` operatör araçlarını kurar ve sahada tek giriş noktası olan `sudo bf-menu` kategori menüsü açılır. ISO/firstboot provisioning yolu (bkz. [`docs/26`](docs/26-BLUEFORCE-FIELD-OS-ISO.md), [`docs/27`](docs/27-OFFLINE-PROVISIONING.md)) **ikincil/opsiyoneldir**, silinmez. Sıfırdan başlayan için adım adım rehber: [`docs/33-OPERATOR-CONSOLE.md`](docs/33-OPERATOR-CONSOLE.md).
+
+## Hızlı Başlangıç (git ile kurulum)
+
+Kurulumun birincil yolu **git deposudur**; ISO/provisioning yolu (aşağıdaki §Kurulum Akışı, [`docs/26`](docs/26-BLUEFORCE-FIELD-OS-ISO.md)) ikincil ve opsiyoneldir. Sahadaki tek giriş noktası `sudo bf-menu` **operatör konsoludur**: kategoriler numarayla seçilir, komut ezberlenmez.
+
+```bash
+# 1) Depoyu indir
+git clone https://github.com/emirhanmamak-blueforce/Blueforce-Linux.git
+cd Blueforce-Linux
+
+# 2) Bootstrap — operatör araçlarını ve bf-* komutlarını kurar
+#    Cihaz kimliği (bayi no) İSTEMEZ; disk bölmez, veri silmez, onaysız güncelleme yapmaz.
+sudo admin/bf-bootstrap.sh
+#    Depoyu klonlamadan tek satır alternatifi:
+#    curl -fsSL https://raw.githubusercontent.com/emirhanmamak-blueforce/Blueforce-Linux/main/admin/bf-bootstrap.sh | sudo bash
+
+# 3) Operatör konsolunu aç
+sudo bf-menu
+```
+
+Menüden **1) Installation → 2) Install this device** seçilir ve 8 haneli bayi no girilir (ör. `12010193` → cihaz `BF-12010193`, hostname `bf-12010193`). Kurulum sonunda cihaz `PROVISIONED_OFFLINE` olur; `READY` yalnız merkez kanalları doğrulanınca alınır.
+
+- Sıfırdan başlayan için adım adım rehber (hangi ekranda ne yazılır): [`docs/33-OPERATOR-CONSOLE.md`](docs/33-OPERATOR-CONSOLE.md)
+- Menü ↔ komut eşlemesi ve kategori haritası aynı dokümanın Ek'lerindedir; özet soru-cevap: [`SUMMARY.md`](SUMMARY.md).
+
 ## Field OS Nedir?
 
 Blueforce Field OS, AdBlue saha otomasyonundaki ~700 Windows mini PC'yi lisans maliyeti olmayan, merkezi yönetilebilir ve kesintisiz çalışan bir Linux filosuna taşıyan **standarttır**. Üç katmanı vardır:
@@ -49,6 +75,8 @@ flowchart TB
 | Fleet Mgmt | Ansible CLI (birincil) + Semaphore UI Community (operatör arayüzü), 15 standart işlem | K-06, K-11 | [`09`](docs/09-FLEET-MANAGEMENT.md), [`10`](docs/10-UPDATE-AND-ROLLBACK-POLICY.md) |
 
 ## Kurulum Akışı (özet)
+
+> **Birincil yol git'tir.** Cihazı kurmanın standart yolu §[Hızlı Başlangıç](#hızlı-başlangıç-git-ile-kurulum) adımlarıdır (depo + `admin/bf-bootstrap.sh` + `sudo bf-menu`, bkz. [`docs/33`](docs/33-OPERATOR-CONSOLE.md)). Aşağıdaki ISO/firstboot akışı **ikincil/opsiyonel** yoldur; silinmemiştir ve offline/air-gapped saha için korunur.
 
 ```mermaid
 flowchart LR
@@ -97,7 +125,7 @@ Boot kabulü (UEFI/Legacy/Secure Boot) ve air-gapped kurulum henüz doğrulanmad
 | Masaüstü kararı | GNOME baseline (K-02); LAB'da GNOME vs XFCE A/B ölçümü yapılır, revizyon yalnız ölçüm verisiyle (K-23) |
 | Doküman dili | Türkçe; komut, dosya, servis ve terim adları İngilizce kalır |
 
-## Doküman Haritası (33 numaralı doküman + şablon)
+## Doküman Haritası (34 numaralı doküman + şablon)
 
 Tüm numaralı dokümanlar `docs/` altındadır ve `docs/_TEMPLATE.md` şablonuna uyar (her dokümanda §1–§13 sırası ve en az bir Mermaid diyagramı vardır).
 
@@ -136,6 +164,7 @@ Tüm numaralı dokümanlar `docs/` altındadır ve `docs/_TEMPLATE.md` şablonun
 | 30 | `30-FIELD-OS-RELEASE-MANAGEMENT.md` | Field OS release, manifest ve rollback |
 | 31 | `31-LEARNING-GUIDE.md` | Field OS öğrenme rehberi (LAB pratiği) |
 | 32 | `32-REPOSITORY-AUDIT-AND-CONFLICTS.md` | Depo denetimi, çelişki raporu ve giderim durumu |
+| 33 | `33-OPERATOR-CONSOLE.md` | Operatör konsolu (`bf-menu`) — sıfırdan başlayan için git kurulumu + menü rehberi |
 
 Şablon: `docs/_TEMPLATE.md` (siteye alınmaz). Karar günlüğü: `docs/24-DECISION-LOG.md`. Özet ve soru-cevap: `SUMMARY.md`.
 
@@ -144,9 +173,10 @@ Tüm numaralı dokümanlar `docs/` altındadır ve `docs/_TEMPLATE.md` şablonun
 ```
 .
 ├── README.md
-├── SUMMARY.md                # Yönetici özeti, 37 soru-cevap, FREE bileşen listesi
+├── SUMMARY.md                # Yönetici özeti, 39 soru-cevap, FREE bileşen listesi
 ├── IMPLEMENTATION-REPORT.md   # Uygulama raporu (ne yapıldı / hangi testler geçti / LAB bekleyenler)
-├── docs/                     # 33 numaralı doküman (00–32) + _TEMPLATE.md
+├── docs/                     # 34 numaralı doküman (00–33) + _TEMPLATE.md
+├── admin/                    # git'ten tek komut kurulum (bf-bootstrap.sh, bf-creds, bf-menu)
 ├── provisioning/             # Field OS medya üretimi
 │   ├── autoinstall/          #   autoinstall.yaml + user-data + meta-data (interactive storage)
 │   ├── iso/                  #   ISO doğrulama + build-blueforce-iso.sh (+ test-iso.sh)
@@ -236,4 +266,4 @@ Maliyet kuralı:
 | F5 | Production rollout (~523) | [ ] |
 | F6 | Gerçek zero-touch PXE (ayrı FAZ) | [ ] |
 
-Repo iskeleti ve uygulama katmanı hazırdır: 33 numaralı doküman, `blueforce-install.sh` + 18 modül, provisioning katmanı (ISO builder, autoinstall, offline-repo sözleşmesi, firstboot, enrollment, release), 21 Ansible playbook + 4 rol, config/monitoring/rustdesk dosyaları ve 8 doğrulama testi bu repodadır. **Field OS kurulum medyası üretilmiştir:** `dist/Blueforce-Field-OS-1.0.0-amd64.iso` (6 481 917 952 byte, SHA256 `cb0cc56f0442fbd1418e0d0f35521522f4ec9aa3f203779a67e96d587d431296`), El Torito BIOS+UEFI korunmuş, `interactive-sections: [storage]` ile operatör disk onayı zorunlu, kimlik/secret gömülü değil. Henüz **hiçbir şey sahaya sürülmedi**: gerçek offline paket deposu yok (pinler `UNPINNED`, `.deb` havuzu boş), merkezi enrollment endpoint'i yok, boot kabulü (UEFI/Legacy/Secure Boot), air-gapped kurulum ve LAB kanıtları alınmadı. Güncel durum, madde madde giderim kaydı ve açık işler [`docs/32`](docs/32-REPOSITORY-AUDIT-AND-CONFLICTS.md) ve [`IMPLEMENTATION-REPORT.md`](IMPLEMENTATION-REPORT.md) içindedir. Sıradaki adımlar [`docs/25`](docs/25-IMPLEMENTATION-ROADMAP.md) yol haritasındadır; sahaya çıkış için önce F2B (offline paket seti + boot kabulü) ve F3 (LAB) kapıları kapanmalıdır.
+Repo iskeleti ve uygulama katmanı hazırdır: 34 numaralı doküman (00–33), `blueforce-install.sh` + 18 modül, git tabanlı operatör konsolu (`admin/bf-bootstrap.sh`, `admin/bf-menu`, `admin/bf-creds`), provisioning katmanı (ISO builder, autoinstall, offline-repo sözleşmesi, firstboot, enrollment, release), 21 Ansible playbook + 4 rol, config/monitoring/rustdesk dosyaları ve doğrulama testleri bu repodadır. **Field OS kurulum medyası üretilmiştir:** `dist/Blueforce-Field-OS-1.0.0-amd64.iso` (6 481 917 952 byte, SHA256 `cb0cc56f0442fbd1418e0d0f35521522f4ec9aa3f203779a67e96d587d431296`), El Torito BIOS+UEFI korunmuş, `interactive-sections: [storage]` ile operatör disk onayı zorunlu, kimlik/secret gömülü değil. Henüz **hiçbir şey sahaya sürülmedi**: gerçek offline paket deposu yok (pinler `UNPINNED`, `.deb` havuzu boş), merkezi enrollment endpoint'i yok, boot kabulü (UEFI/Legacy/Secure Boot), air-gapped kurulum ve LAB kanıtları alınmadı. Güncel durum, madde madde giderim kaydı ve açık işler [`docs/32`](docs/32-REPOSITORY-AUDIT-AND-CONFLICTS.md) ve [`IMPLEMENTATION-REPORT.md`](IMPLEMENTATION-REPORT.md) içindedir. Sıradaki adımlar [`docs/25`](docs/25-IMPLEMENTATION-ROADMAP.md) yol haritasındadır; sahaya çıkış için önce F2B (offline paket seti + boot kabulü) ve F3 (LAB) kapıları kapanmalıdır.
