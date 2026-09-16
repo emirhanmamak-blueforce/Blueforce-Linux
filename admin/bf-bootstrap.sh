@@ -297,20 +297,44 @@ elif [[ "$CHECK_MODE" -eq 1 ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# 6. bf-menu: the on-device installer menu entry point.
+# 6. Operator console entry point.
+#
+#    The Python console (`admin/bf` -> bfos) is the primary path; the bash
+#    `bf-menu` stays linked as a fallback so a host without python3 can still be
+#    operated.
 # --------------------------------------------------------------------------- #
+PY_CONSOLE="$DIR/admin/bf"
 MENU_SOURCE="$DIR/admin/bf-menu"
+MENU_READY=0
+
+if [[ -f "$PY_CONSOLE" ]]; then
+    if [[ "$CHECK_MODE" -eq 1 ]]; then
+        say "check: would make $PY_CONSOLE executable and link $BIN_DIR/bf"
+    else
+        chmod 0755 "$PY_CONSOLE"
+        ln -sfn "$PY_CONSOLE" "$BIN_DIR/bf"
+        say "bf ready: $BIN_DIR/bf (Python console)"
+    fi
+    MENU_READY=1
+else
+    warn "admin/bf is not present in $DIR; the Python console arrives with the next revision of the checkout"
+fi
+
 if [[ -f "$MENU_SOURCE" ]]; then
     if [[ "$CHECK_MODE" -eq 1 ]]; then
         say "check: would make $MENU_SOURCE executable and link $BIN_DIR/bf-menu"
     else
         chmod 0755 "$MENU_SOURCE"
         ln -sfn "$MENU_SOURCE" "$BIN_DIR/bf-menu"
-        say "bf-menu ready: $BIN_DIR/bf-menu"
+        say "bf-menu ready: $BIN_DIR/bf-menu (bash fallback)"
     fi
     MENU_READY=1
 else
-    warn "admin/bf-menu is not present in $DIR; 'sudo bf-menu' will work once the menu module is in the checkout"
+    warn "admin/bf-menu is not present in $DIR; the bash fallback will work once it is in the checkout"
+fi
+
+if [[ "$MENU_READY" -eq 0 ]]; then
+    warn "no operator console was found in $DIR; link one of admin/bf or admin/bf-menu manually"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -336,11 +360,22 @@ if [[ -n "$REVISION" ]]; then
     printf '  revision    : %s\n' "$REVISION"
 fi
 printf '  tools       : %s linked into %s\n' "$LINKED" "$BIN_DIR"
-if [[ "$MENU_READY" -eq 1 ]]; then
-    printf '  bf-menu     : %s\n' "$BIN_DIR/bf-menu"
+if [[ -x "$BIN_DIR/bf" ]]; then
+    printf '  console     : %s (Python, primary)\n' "$BIN_DIR/bf"
 else
-    printf '  bf-menu     : pending (admin/bf-menu is not in the checkout yet)\n'
+    printf '  console     : pending (admin/bf is not in the checkout yet)\n'
 fi
-printf '  next        : sudo bf-menu\n'
-printf '\nInstallation complete. To get started: sudo bf-menu\n'
-printf 'Kurulum tamam. Başlamak için: sudo bf-menu\n'
+if [[ -x "$BIN_DIR/bf-menu" ]]; then
+    printf '  fallback    : %s (bash)\n' "$BIN_DIR/bf-menu"
+else
+    printf '  fallback    : pending (admin/bf-menu is not in the checkout yet)\n'
+fi
+# The Python console is the recommended entry point; the bash menu stays as the
+# fallback for a host without python3.
+if [[ -x "$BIN_DIR/bf" ]]; then
+    printf '  next        : sudo bf\n'
+else
+    printf '  next        : sudo bf-menu\n'
+fi
+printf '\nInstallation complete. To get started: sudo bf\n'
+printf 'Kurulum tamam. Başlamak için: sudo bf\n'

@@ -1,0 +1,64 @@
+#!/bin/sh
+''''command -v python3 >/dev/null 2>&1 || { printf '%s\n' "HATA: python3 bulunamadı. bfos operatör konsolu için Python 3.8 veya üzeri gerekir." "" "Yedek yol (bash): sudo admin/bf-menu    ya da kuruluysa: sudo bf-menu" >&2; exit 3; }; exec python3 "$0" "$@" # '''
+"""bfos operator console — thin entry point (sh/Python polyglot).
+
+The file is valid POSIX shell *and* valid Python:
+
+* run as ``admin/bf`` (or as the ``bf`` symlink that
+  ``admin/bf-bootstrap.sh`` creates), the shell line above checks that
+  ``python3`` exists and, when it does not, prints a Turkish error and points at
+  the proven bash console (``admin/bf-menu``) — a device without Python is still
+  operational,
+* everything after that line is the Python entry point: it puts the repository
+  root on ``sys.path`` and calls :func:`bfos.cli.main`. Nothing else lives here;
+  all logic is in the ``bfos`` package next to it.
+
+Usage: sudo bfos [--full] [--dry-run] [--check] [--repo YOL] [--version] [--lang tr]
+"""
+
+import os
+import sys
+
+MIN_PYTHON = (3, 8)
+
+if sys.version_info < MIN_PYTHON:  # pragma: no cover - depends on the interpreter
+    sys.stderr.write(
+        "HATA: Python sürümü çok eski: {0}. bfos için Python {1}.{2}+ gerekir.\n".format(
+            sys.version.split()[0], MIN_PYTHON[0], MIN_PYTHON[1]
+        )
+    )
+    sys.stderr.write("Yedek yol (bash): sudo admin/bf-menu\n")
+    raise SystemExit(3)
+
+
+def _repository_root():
+    """First candidate directory that actually contains the bfos package."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    candidates = [
+        os.environ.get("BF_REPO", ""),
+        os.path.dirname(here),  # <repo>/admin/bf -> <repo>
+        here,
+        os.getcwd(),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(os.path.join(candidate, "bfos", "__init__.py")):
+            return candidate
+    return ""
+
+
+ROOT = _repository_root()
+if not ROOT:
+    sys.stderr.write(
+        "HATA: bfos paketi bulunamadı. Konsolu Blueforce deposunun içinden çalıştırın,\n"
+        "ya da --repo YOL ile depo yolunu belirtin.\n"
+        "Yedek yol (bash): sudo admin/bf-menu\n"
+    )
+    raise SystemExit(3)
+
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from bfos.cli import main  # noqa: E402  (sys.path is prepared above)
+
+if __name__ == "__main__":
+    raise SystemExit(main())

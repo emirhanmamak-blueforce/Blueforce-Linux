@@ -236,7 +236,7 @@ contract 'bf-bootstrap wires up bf-menu' "$BOOTSTRAP" has 'bf-menu'
 contract 'bf-bootstrap supports Ubuntu 24.04' "$BOOTSTRAP" has '24\.04'
 contract 'bf-bootstrap supports Ubuntu 26.04' "$BOOTSTRAP" has '26\.04'
 contract 'bf-bootstrap has a read-only check mode' "$BOOTSTRAP" has 'CHECK_MODE'
-contract 'bf-bootstrap prints the completion contract' "$BOOTSTRAP" has 'Kurulum tamam\. Başlamak için: sudo bf-menu'
+contract 'bf-bootstrap prints the completion contract' "$BOOTSTRAP" has 'Kurulum tamam\. Başlamak için: sudo bf'
 contract 'bf-bootstrap carries no private key material' "$BOOTSTRAP" lacks 'BEGIN [A-Z ]*PRIVATE KEY'
 contract 'bf-bootstrap generates no WireGuard key' "$BOOTSTRAP" lacks 'wg genkey'
 
@@ -256,7 +256,7 @@ control 'bf-bootstrap root check is checked' "$WORK/b-no-root.sh" has 'id -u'
 
 sed -E '/Kurulum tamam/d' "$BOOTSTRAP" > "$WORK/b-no-summary.sh"
 chmod 0755 "$WORK/b-no-summary.sh"
-control 'bf-bootstrap completion contract is checked' "$WORK/b-no-summary.sh" has 'Kurulum tamam\. Başlamak için: sudo bf-menu'
+control 'bf-bootstrap completion contract is checked' "$WORK/b-no-summary.sh" has 'Kurulum tamam\. Başlamak için: sudo bf'
 
 # --------------------------------------------------------------------------- #
 # 4. bf-bootstrap.sh runtime: --check is mutation-free, apply mode works.
@@ -384,9 +384,9 @@ set -e
 expect_rc 'bf-bootstrap apply mode exits 0 in the sandbox' 0 "$apply_rc"
 expect_present 'bf-bootstrap cloned the repository' "$APPLY_ROOT/checkout/.git"
 expect_present 'bf-bootstrap linked a diagnostics tool' "$APPLY_ROOT/bin/bf-status"
-expect_contains 'bf-bootstrap prints the completion contract' "$WORK/apply1.out" 'Kurulum tamam. Başlamak için: sudo bf-menu'
+expect_contains 'bf-bootstrap prints the completion contract' "$WORK/apply1.out" 'Kurulum tamam. Başlamak için: sudo bf'
 expect_contains 'bf-bootstrap reports the repository in its summary' "$WORK/apply1.out" "$APPLY_ROOT/checkout"
-expect_contains 'bf-bootstrap warns when bf-menu is not in the clone' "$WORK/apply1.out" 'admin/bf-menu is not present'
+expect_contains 'bf-bootstrap warns when the Python console is not in the clone' "$WORK/apply1.out" 'admin/bf is not present'
 linked1="$(find "$APPLY_ROOT/bin" -maxdepth 1 -type l 2>/dev/null | wc -l | tr -d ' ')"
 check
 if [[ "$linked1" -ge 10 ]]; then

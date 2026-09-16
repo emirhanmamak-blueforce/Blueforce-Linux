@@ -1,0 +1,71 @@
+# Blueforce Field OS - offline APT deposu künyesi (repository record)
+#
+# Bu dosyayı provisioning/offline-repo/build-index.sh üretir ve her derlemede
+# günceller. Elle düzenlemeyin: bir sonraki derleme dosyanın tamamını yeniden
+# yazar (yalnız generated_at alanı serbest bırakılır, içerik değişmediyse dosya
+# korunur).
+#
+# Amaç: deponun hangi Ubuntu sürümü, hangi mimari ve hangi paketlerle
+# üretildiğini kanıtlamak. Kurucu (scripts/install/blueforce-install.sh
+# --offline) bu dosyayı OKUMAZ; denetim, yeniden üretim ve teslim kaydı için
+# insan okur. Kurucunun doğruladığı dosyalar: Packages, Packages.gz,
+# packages.lock.tsv, SHA256SUMS ve pool/ içindeki .deb dosyaları.
+#
+# Aşağıdaki değerler "henüz derlenmedi" durumunu gösterir: packages/ altına
+# paket eklenip ./build-index.sh çalıştırıldığında gerçek değerler yazılır.
+#
+# Alan listesi (şema):
+#   schema_version        bu dosyanın sürümü
+#   repository.*          deponun künyesi ve dizin/indeks bilgileri
+#   repository.state      UNBUILT (henüz indissiz) ya da BUILT
+#   repository.package_count / total_bytes / total_size   paket sayısı ve boyut
+#   repository.index_sha256   indeks dosyalarının SHA256 değerleri
+#   repository.manifests      okunan pin manifestleri
+#   repository.pinned_packages  manifestlerdeki pin sayısı
+#   packages[]            her paket: ad, sürüm, mimari, sha256, boyut, dosya adı,
+#                         pinned_in (hangi manifestte pinli; boş liste = yalnızca
+#                         bağımlılık olarak eklenmiş)
+
+schema_version: 1
+description: "Offline APT deposunun künyesi"
+
+repository:
+  name: 'blueforce-offline-apt'
+  format: 'apt-deb'
+  state: 'UNBUILT'
+  ubuntu_release: 'unknown'
+  architecture: 'amd64'
+  generated_at: 'UNBUILT'
+  generated_by: 'provisioning/offline-repo/build-index.sh'
+  package_count: 0
+  total_bytes: 0
+  total_size: '0 B'
+  pool: 'pool/'
+  bundle_dir: 'provisioning/offline-repo/built'
+  install_path: '/opt/blueforce/offline-repo'
+  consumer: 'scripts/install/blueforce-install.sh --offline'
+  index_files:
+    - 'Packages'
+    - 'Packages.gz'
+    - 'packages.lock.tsv'
+    - 'SHA256SUMS'
+  index_sha256:
+    Packages: 'UNBUILT'
+    Packages.gz: 'UNBUILT'
+    packages.lock.tsv: 'UNBUILT'
+  manifests:
+    - 'base-packages.txt'
+    - 'docker.txt'
+    - 'remote-access.txt'
+  pinned_packages: 0
+
+# Derleme sonrası doldurulacak biçim (bu blok yalnızca örnektir, veri değildir):
+# packages:
+#   - package: 'curl'
+#     version: '8.9.1-1ubuntu1'
+#     architecture: 'amd64'
+#     sha256: '<64 haneli sha256>'
+#     size_bytes: 123456
+#     source: 'curl_8.9.1-1ubuntu1_amd64.deb'
+#     pinned_in: ['base-packages.txt']
+packages: []

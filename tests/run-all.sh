@@ -21,7 +21,7 @@ filters=("$@")
 tests=()
 while IFS= read -r script; do
   tests+=("$script")
-done < <(find "$SCRIPT_DIR" -maxdepth 1 -type f -name '*.sh' ! -name "$SELF" | sort)
+done < <(find "$SCRIPT_DIR" -maxdepth 1 -type f \( -name '*.sh' -o -name 'test_*.py' -o -name 'check_*.py' \) ! -name "$SELF" | sort)
 
 if [[ ${#tests[@]} -eq 0 ]]; then
   printf 'run-all: no tests found in %s\n' "$SCRIPT_DIR" >&2
@@ -54,7 +54,16 @@ failures=()
 for script in "${selected[@]}"; do
   name="$(basename "$script")"
   printf '\n=== %s ===\n' "$name"
-  bash "$script"
+  case "$script" in
+    *.py)
+      # Python suites run from the repository root so `import bfos` and
+      # `tests.test_*` module paths resolve.
+      ( cd "$REPO_ROOT" && python3 "$script" )
+      ;;
+    *)
+      ( cd "$REPO_ROOT" && bash "$script" )
+      ;;
+  esac
   status=$?
   if [[ "$status" -eq 0 ]]; then
     printf '%s\n' "--- $name: PASS"

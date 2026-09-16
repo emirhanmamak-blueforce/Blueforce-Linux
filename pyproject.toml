@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bfos"
+version = "1.0.0"
+description = "Blueforce Field OS operator console (Turkish, standard library only)"
+readme = "admin/README.md"
+requires-python = ">=3.8"
+license = { text = "Proprietary" }
+authors = [{ name = "Blueforce" }]
+# Zero external dependencies on purpose: field devices are installed offline
+# from a verified local package bundle (docs/27), and the console must run with
+# nothing but the Python standard library.
+dependencies = []
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.urls]
+Documentation = "https://github.com/emirhanmamak-blueforce/Blueforce-Linux"
+
+[project.scripts]
+bfos = "bfos.cli:main"
+
+[tool.setuptools]
+packages = ["bfos"]
