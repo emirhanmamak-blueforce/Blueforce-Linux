@@ -1,0 +1,24 @@
+# Purpose: Reference spoke config for field devices joining the hub.
+# Scope: Peer name bf-<ID> with fixed tunnel IP; hub values come from inventory.
+# Safety: Example only; replace every <REPLACE> placeholder before installing to /etc/wireguard/.
+# Ref: docs/08-WIREGUARD-AND-NETWORK.md, K-05; peer naming K-12.
+
+[Interface]
+# Tunnel address from inventory (one fixed /32 per device, hub is 10.8.0.1).
+Address = 10.8.0.15/32
+# Device private key. <REPLACE> with the real key; never commit it.
+PrivateKey = <REPLACE_DEVICE_PRIVATE_KEY>
+# Open management ports on the tunnel interface when it comes up.
+PostUp = ufw allow in on wg0 to any port 22 proto tcp; ufw allow in on wg0 to any port 3389 proto tcp
+# Remove tunnel-scoped management rules when the tunnel goes down.
+PostDown = ufw delete allow in on wg0 to any port 22 proto tcp; ufw delete allow in on wg0 to any port 3389 proto tcp
+
+[Peer]
+# Hub public key. <REPLACE> with the real hub key.
+PublicKey = <REPLACE_HUB_PUBLIC_KEY>
+# Hub endpoint. <REPLACE> with the real hub address.
+Endpoint = <REPLACE_HUB_HOST>:51820
+# Return traffic is limited to the tunnel subnet.
+AllowedIPs = 10.8.0.0/16
+# Keep the NAT/CGNAT mapping alive behind mobile networks.
+PersistentKeepalive = 25

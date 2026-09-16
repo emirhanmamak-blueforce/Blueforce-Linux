@@ -1,0 +1,13 @@
+# Auto-provision the fleet dashboard from disk (no manual import).
+apiVersion: 1
+
+providers:
+  - name: blueforce-fleet
+    orgId: 1
+    folder: Blueforce
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

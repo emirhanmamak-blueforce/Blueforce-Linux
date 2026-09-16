@@ -1,0 +1,25 @@
+---
+# Monitoring baseline: node exporter install + health signal files.
+# No Semaphore Pro feature is used.
+- name: Ensure monitoring packages are present
+  ansible.builtin.apt:
+    name: "{{ monitoring_packages }}"
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Enable and start node exporter
+  ansible.builtin.systemd:
+    name: "{{ monitoring_service }}"
+    enabled: true
+    state: started
+
+- name: Verify unattended-upgrades stay disabled (policy docs/10)
+  ansible.builtin.shell: 'grep -E ''Unattended-Upgrade "0"'' /etc/apt/apt.conf.d/20auto-upgrades'
+  register: unattended_check
+  changed_when: false
+  failed_when: false
+
+- name: Report monitoring state
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} exporter={{ monitoring_service }} unattended_off={{ unattended_check.rc == 0 }}"

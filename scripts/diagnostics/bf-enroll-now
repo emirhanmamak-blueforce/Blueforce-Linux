@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Interactive wrapper: token input is accepted only through stdin by bf-enroll.
+set -euo pipefail
+exec "$(dirname "$0")/bf-enroll" --token-stdin "$@"

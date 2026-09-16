@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Blueforce enrollment V1 request",
+  "description": "Sent by bf-enroll from a PROVISIONED_OFFLINE device. Carries public facts only: the WireGuard private key, the one-time token value and every other credential stay on the device. The single-use token travels in the Authorization header, never in this document.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["device_id", "wireguard_public_key", "idempotency_key", "hardware", "release"],
+  "properties": {
+    "device_id": {
+      "type": "string",
+      "pattern": "^BF-[0-9]{8}$",
+      "description": "Fleet identity derived from the validated dealer number."
+    },
+    "wireguard_public_key": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{43}=$",
+      "description": "Device public key only. The matching private key never leaves the device."
+    },
+    "idempotency_key": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "sha256(provisioning_id | device_id | wireguard_public_key). Stable across retries so central can deduplicate retries while the one-time credential stays single-use."
+    },
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["machine_id", "product_uuid", "sys_vendor"],
+      "properties": {
+        "machine_id": {"type": "string"},
+        "product_uuid": {"type": "string"},
+        "sys_vendor": {"type": "string"}
+      }
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os_release", "kernel"],
+      "properties": {
+        "os_release": {"type": "string"},
+        "kernel": {"type": "string"}
+      }
+    }
+  }
+}

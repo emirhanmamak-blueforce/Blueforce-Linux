@@ -1,0 +1,41 @@
+# Prometheus configuration for the Blueforce fleet.
+# Scrape interval 60s keeps cardinality/storage tractable at 700 nodes.
+# Fleet targets scale via file-based service discovery: add/remove entries
+# in targets/fleet.json without reloading Prometheus (refresh_interval 30s).
+
+global:
+  scrape_interval: 60s
+  scrape_timeout: 10s
+  evaluation_interval: 60s
+  external_labels:
+    fleet: blueforce
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  # Prometheus self-monitoring.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Field devices: Node Exporter (:9100) + textfile collector metrics.
+  # Identity label contract: device_id="BF-<no>" on every target.
+  - job_name: node
+    file_sd_configs:
+      - files: ["/etc/prometheus/targets/*.json"]
+        refresh_interval: 30s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __address__
+        regex: (.+)
+        replacement: ${1}:9100
+      - source_labels: [device_id]
+        target_label: device_id
+        regex: (.+)
+        replacement: ${1}
+    metric_relabel_configs:
+      # Enforce the device_id label contract; drop series without it.
+      - source_labels: [device_id]
+        regex: .+
+        action: keep

@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# Read-only Field OS hardware compatibility check. It does not install, wipe, or modify state.
+#
+# This script is itself the read-only "--check" gate of the Windows -> Field OS
+# migration: it only reads /proc, /sys, lsblk, lsusb and (optionally) smartctl.
+# No package is installed, no disk is written, no service or network state is
+# touched.
+#
+# Checks and thresholds (verdict = worst single check):
+#
+#   check         SUPPORTED                              WARNING                                   BLOCKED
+#   ------------  -------------------------------------  ----------------------------------------  ---------------------------------
+#   architecture  x86_64                                 -                                         any other value
+#   ram           >= 4096 MiB                            2048..4095 MiB                            < 2048 MiB
+#   disk          at least one disk >= 64 GiB            -                                         no disk >= 64 GiB
+#   disk_type     SSD (or mixed/unknown)                 only rotational disks (HDD)               -
+#   smart         smartctl reports PASSED                smartctl missing / no readable result     smartctl reports FAILED
+#   nic           >= 1 non-loopback interface            -                                         no non-loopback interface
+#   nic_link      >= 1 interface operstate up            interface present but none up             -
+#   serial        /dev/ttyS*|ttyUSB*|ttyACM* present     no serial device at all                   -
+#   usb           lsusb returns devices                  lsusb unavailable/empty                   -
+#   boot_mode     UEFI boot                              legacy BIOS boot                          -
+#   secure_boot   enabled/disabled/not applicable         UEFI but state unreadable                 -
+#   tpm           TPM device present                     -                                         -
+#   virt          bare metal (virt = none)               running inside a hypervisor               -
+#   cpu_virt      vmx/svm present                        no virtualization extensions exposed      -
+#
+# A BLOCKED result means the host must not proceed to a migration install until
+# reviewed. WARNING means LAB / peripheral acceptance work is still outstanding.
+set -euo pipefail
+
+MODE="markdown"
+usage() {
+  cat <<'EOF'
+Usage: bf-live-hw-check [--json | --markdown] [--help]
+
+Evaluates the live host for Field OS baseline compatibility without changing the
+host. Verdicts are SUPPORTED, WARNING, or BLOCKED. A BLOCKED result means the
+host must not proceed to a migration install until reviewed.
+
+Checks: architecture, ram, disk, disk_type, smart, nic, nic_link, serial, usb,
+boot_mode, secure_boot, tpm, virt, cpu_virt. The overall verdict is the worst
+single check. Thresholds:
+  BLOCKED  non-x86_64 | RAM < 2048 MiB | no disk >= 64 GiB | SMART FAILED | no NIC
+  WARNING  RAM 2048-4095 MiB | HDD-only | smartctl missing | no NIC link up |
+           no serial device | no USB inventory | legacy BIOS | UEFI Secure Boot
+           state unreadable | hypervisor detected | no vmx/svm
+  SUPPORTED  everything else; this is not a replacement for the doc 13 MEG
+           acceptance test.
+EOF
+}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) MODE="json"; shift ;;
+    --markdown) MODE="markdown"; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+clean() { tr '\n' ' ' | tr -s ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1])' 2>/dev/null || sed 's/\\/\\\\/g;s/"/\\"/g'; }
+status_rank() { case "$1" in SUPPORTED) echo 0;; WARNING) echo 1;; BLOCKED) echo 2;; esac; }
+
+ARCH="$(uname -m 2>/dev/null || printf unknown)"
+RAM_MB="$(awk '/MemTotal:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || printf 0)"
+DISK_LINES="$(lsblk -bdn -o NAME,SIZE,TYPE 2>/dev/null | awk '$3 == "disk" {print $1 ":" $2}' || true)"
+DISK_COUNT="$(printf '%s\n' "$DISK_LINES" | awk 'NF {count++} END {print count+0}')"
+LARGEST_DISK_BYTES="$(printf '%s\n' "$DISK_LINES" | awk -F: 'NF == 2 && $2 > max {max=$2} END {print max+0}')"
+NIC_LIST="$(find /sys/class/net -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | grep -vx 'lo' | paste -sd, - || true)"
+SERIAL_LIST="$({ compgen -G '/dev/ttyS*' || true; compgen -G '/dev/ttyUSB*' || true; compgen -G '/dev/ttyACM*' || true; } 2>/dev/null | paste -sd, - || true)"
+USB_LIST="$(lsusb 2>/dev/null | head -20 | clean || true)"
+
+# --- architecture -----------------------------------------------------------
+ARCH_STATUS="SUPPORTED"; ARCH_NOTE="x86_64 architecture detected"
+if [[ "$ARCH" != "x86_64" ]]; then ARCH_STATUS="BLOCKED"; ARCH_NOTE="Field OS baseline requires x86_64; detected $ARCH"; fi
+
+# --- ram --------------------------------------------------------------------
+RAM_STATUS="SUPPORTED"; RAM_NOTE="$RAM_MB MiB detected (minimum 4096 MiB)"
+if (( RAM_MB < 2048 )); then RAM_STATUS="BLOCKED"; RAM_NOTE="$RAM_MB MiB detected; below 2048 MiB hard floor"
+elif (( RAM_MB < 4096 )); then RAM_STATUS="WARNING"; RAM_NOTE="$RAM_MB MiB detected; below 4096 MiB baseline"; fi
+
+# --- disks ------------------------------------------------------------------
+DISK_STATUS="SUPPORTED"; DISK_NOTE="$DISK_COUNT disk(s), largest $((LARGEST_DISK_BYTES / 1024 / 1024 / 1024)) GiB (minimum 64 GiB)"
+if (( DISK_COUNT == 0 || LARGEST_DISK_BYTES < 68719476736 )); then DISK_STATUS="BLOCKED"; DISK_NOTE="No disk at or above 64 GiB was detected"; fi
+
+# --- disk type (rotational vs solid state) ----------------------------------
+# loop/zram/sr pseudo-devices are excluded: they are not migration targets.
+DISK_TYPE_LIST="$(lsblk -bdn -o NAME,ROTA 2>/dev/null | awk '$1 !~ /^(loop|zram|ram|sr|fd)/ {if ($2 == "0") printf "%s:ssd ", $1; else if ($2 == "1") printf "%s:hdd ", $1}' | clean || true)"
+DISK_HDD_COUNT="$(printf '%s\n' "$DISK_TYPE_LIST" | tr ' ' '\n' | grep -c ':hdd$' || true)"
+DISK_SSD_COUNT="$(printf '%s\n' "$DISK_TYPE_LIST" | tr ' ' '\n' | grep -c ':ssd$' || true)"
+DISK_TYPE_STATUS="SUPPORTED"
+if [[ -z "$DISK_TYPE_LIST" ]]; then
+  DISK_TYPE_NOTE="Rotational information unavailable; validate disk type in LAB"
+elif (( DISK_HDD_COUNT > 0 && DISK_SSD_COUNT == 0 )); then
+  DISK_TYPE_STATUS="WARNING"; DISK_TYPE_NOTE="Only rotational disk(s) detected ($DISK_TYPE_LIST); SSD baseline expected for field durability"
+elif (( DISK_HDD_COUNT > 0 )); then
+  DISK_TYPE_NOTE="Disk media: $DISK_TYPE_LIST(mixed: $DISK_HDD_COUNT hdd / $DISK_SSD_COUNT ssd)"
+else
+  DISK_TYPE_NOTE="Disk media: $DISK_TYPE_LIST"
+fi
+
+# --- smart health -----------------------------------------------------------
+SMART_STATUS="SUPPORTED"; SMART_NOTE="SMART health not reported"
+if command -v smartctl >/dev/null 2>&1; then
+  SMART_RESULT=""
+  for device in /dev/sd? /dev/nvme?n1; do
+    [[ -b "$device" ]] || continue
+    health="$(smartctl -H "$device" 2>/dev/null | awk '/SMART overall-health|SMART Health Status/ {print; exit}' | clean || true)"
+    [[ -n "$health" ]] && SMART_RESULT="${SMART_RESULT}${device}: ${health}; "
+  done
+  if [[ -z "$SMART_RESULT" ]]; then
+    SMART_STATUS="WARNING"; SMART_NOTE="smartctl present but no disk reported a health result (unsupported device or permissions); validate in LAB"
+  elif grep -qiE 'FAILED|BAD' <<<"$SMART_RESULT"; then
+    SMART_STATUS="BLOCKED"; SMART_NOTE="Disk health FAILED: $(clean <<<"$SMART_RESULT")"
+  else
+    SMART_NOTE="SMART: $(clean <<<"$SMART_RESULT")"
+  fi
+else
+  SMART_STATUS="WARNING"; SMART_NOTE="smartctl not installed; disk health unverified (install smartmontools or validate in LAB)"
+fi
+
+# --- nic / link state -------------------------------------------------------
+NIC_STATUS="SUPPORTED"; NIC_NOTE="Network interfaces: ${NIC_LIST:-none}"
+if [[ -z "$NIC_LIST" ]]; then NIC_STATUS="BLOCKED"; NIC_NOTE="No non-loopback network interface detected"; fi
+
+NIC_LINK_PHYSICAL=""
+NIC_LINK_PHYSICAL_UP=0
+NIC_UP_COUNT=0
+VIRTUAL_IFACE_PATTERN='^(veth|br-|docker|virbr|vmnet|tun|tap|wg|zram|dummy|bond|vnet)'
+for iface_path in /sys/class/net/*; do
+  [[ -d "$iface_path" ]] || continue
+  iface_name="$(basename "$iface_path")"
+  [[ "$iface_name" == "lo" ]] && continue
+  iface_state="$(cat "$iface_path/operstate" 2>/dev/null || printf unknown)"
+  [[ "$iface_state" == "up" ]] && NIC_UP_COUNT=$((NIC_UP_COUNT + 1))
+  if [[ ! "$iface_name" =~ $VIRTUAL_IFACE_PATTERN ]]; then
+    NIC_LINK_PHYSICAL="${NIC_LINK_PHYSICAL}${iface_name}=${iface_state} "
+    [[ "$iface_state" == "up" ]] && NIC_LINK_PHYSICAL_UP=$((NIC_LINK_PHYSICAL_UP + 1))
+  fi
+done
+NIC_LINK_DETAIL="$(clean <<<"$NIC_LINK_PHYSICAL")"
+NIC_LINK_STATUS="SUPPORTED"
+NIC_LINK_NOTE="Up: $NIC_UP_COUNT interface(s), physical: ${NIC_LINK_DETAIL:-none} (virtual interfaces excluded from the physical column)"
+if [[ -n "$NIC_LIST" && $NIC_UP_COUNT -eq 0 ]]; then
+  NIC_LINK_STATUS="WARNING"; NIC_LINK_NOTE="Interfaces exist but none is up; check cabling/switch before migration"
+elif [[ -n "$NIC_LIST" && $NIC_LINK_PHYSICAL_UP -eq 0 ]]; then
+  NIC_LINK_STATUS="WARNING"; NIC_LINK_NOTE="No physical interface is up (only virtual interfaces): ${NIC_LINK_DETAIL:-none}; check cabling/switch before migration"
+fi
+
+# --- serial ports -----------------------------------------------------------
+SERIAL_STATUS="SUPPORTED"; SERIAL_NOTE="Serial interfaces: ${SERIAL_LIST:-none}"
+if [[ -z "$SERIAL_LIST" ]]; then SERIAL_STATUS="WARNING"; SERIAL_NOTE="No serial interface detected; validate MEG peripheral path in LAB"; fi
+if [[ -n "$SERIAL_LIST" && "$SERIAL_LIST" != *"ttyUSB"* && "$SERIAL_LIST" != *"ttyACM"* ]]; then
+  SERIAL_NOTE="$SERIAL_NOTE; no USB-serial adapter (ttyUSB/ttyACM) detected"
+fi
+
+# --- usb --------------------------------------------------------------------
+USB_STATUS="SUPPORTED"; USB_NOTE="USB devices detected"
+if [[ -z "$USB_LIST" ]]; then USB_STATUS="WARNING"; USB_NOTE="No USB inventory available (install nothing; validate USB peripherals manually)"; fi
+
+# --- boot mode --------------------------------------------------------------
+BOOT_MODE="bios"
+[[ -d /sys/firmware/efi ]] && BOOT_MODE="uefi"
+BOOT_STATUS="SUPPORTED"
+if [[ "$BOOT_MODE" == "uefi" ]]; then BOOT_NOTE="UEFI boot detected"; else BOOT_STATUS="WARNING"; BOOT_NOTE="Legacy BIOS boot detected; confirm firmware mode and boot chain in LAB"; fi
+
+# --- secure boot ------------------------------------------------------------
+SECURE_BOOT="unknown"
+if [[ "$BOOT_MODE" != "uefi" ]]; then
+  SECURE_BOOT="not-applicable"
+else
+  sb_file="$(ls /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$sb_file" ]]; then
+    sb_byte="$(od -An -tu1 -j4 -N1 "$sb_file" 2>/dev/null | tr -d ' \n' || true)"
+    case "$sb_byte" in
+      1) SECURE_BOOT="enabled" ;;
+      0) SECURE_BOOT="disabled" ;;
+    esac
+  fi
+fi
+SECURE_BOOT_STATUS="SUPPORTED"
+case "$SECURE_BOOT" in
+  enabled) SECURE_BOOT_NOTE="Secure Boot enabled; verify signed-boot chain with the Field OS medium in LAB" ;;
+  disabled) SECURE_BOOT_NOTE="Secure Boot disabled; acceptable for the baseline, record the state" ;;
+  not-applicable) SECURE_BOOT_NOTE="Not applicable (legacy BIOS boot)" ;;
+  *) SECURE_BOOT_STATUS="WARNING"; SECURE_BOOT_NOTE="Secure Boot state unreadable (root required for efivars); verify in firmware setup" ;;
+esac
+
+# --- tpm --------------------------------------------------------------------
+TPM_STATUS="SUPPORTED"
+if [[ -e /dev/tpm0 || -e /dev/tpmrm0 ]]; then
+  TPM_NOTE="TPM device present (inventory field; not a baseline requirement)"
+else
+  TPM_NOTE="No TPM device detected (inventory field only; the baseline does not require a TPM)"
+fi
+
+# --- virtualisation ---------------------------------------------------------
+# systemd-detect-virt exits 1 on bare metal (prints "none"), hence "|| true".
+VIRT_TYPE="$(systemd-detect-virt 2>/dev/null || true)"
+VIRT_TYPE="$(clean <<<"$VIRT_TYPE")"
+[[ -z "$VIRT_TYPE" ]] && VIRT_TYPE="unknown"
+if [[ "$VIRT_TYPE" == "none" ]]; then
+  VIRT_STATUS="SUPPORTED"; VIRT_NOTE="Bare metal"
+else
+  VIRT_STATUS="WARNING"; VIRT_NOTE="Running inside a hypervisor ($VIRT_TYPE); confirm this is the intended LAB/template host"
+fi
+
+# --- cpu virtualization extensions -----------------------------------------
+if grep -qm1 -E '(^flags|^Features).*( vmx| svm)' /proc/cpuinfo 2>/dev/null; then
+  CPU_VIRT_STATUS="SUPPORTED"; CPU_VIRT_NOTE="CPU virtualization extensions exposed (vmx/svm)"
+else
+  CPU_VIRT_STATUS="WARNING"; CPU_VIRT_NOTE="No vmx/svm flag exposed; QEMU/KVM LAB profiles need nested virtualization on the host"
+fi
+
+OVERALL="SUPPORTED"
+for current in "$ARCH_STATUS" "$RAM_STATUS" "$DISK_STATUS" "$DISK_TYPE_STATUS" "$SMART_STATUS" "$NIC_STATUS" "$NIC_LINK_STATUS" "$SERIAL_STATUS" "$USB_STATUS" "$BOOT_STATUS" "$SECURE_BOOT_STATUS" "$TPM_STATUS" "$VIRT_STATUS" "$CPU_VIRT_STATUS"; do
+  if (( $(status_rank "$current") > $(status_rank "$OVERALL") )); then OVERALL="$current"; fi
+done
+
+if [[ "$MODE" == "json" ]]; then
+  cat <<EOF
+{
+  "schema_version": 1,
+  "report_type": "blueforce-live-hardware-compatibility",
+  "read_only": true,
+  "overall": "$(printf '%s' "$OVERALL" | json_escape)",
+  "checks": [
+    {"name":"architecture","status":"$ARCH_STATUS","value":"$(printf '%s' "$ARCH" | json_escape)","note":"$(printf '%s' "$ARCH_NOTE" | json_escape)"},
+    {"name":"ram","status":"$RAM_STATUS","value":"${RAM_MB} MiB","note":"$(printf '%s' "$RAM_NOTE" | json_escape)"},
+    {"name":"disk","status":"$DISK_STATUS","value":"${DISK_COUNT} disk(s)","note":"$(printf '%s' "$DISK_NOTE" | json_escape)"},
+    {"name":"disk_type","status":"$DISK_TYPE_STATUS","value":"$(printf '%s' "${DISK_TYPE_LIST:-unavailable}" | json_escape)","note":"$(printf '%s' "$DISK_TYPE_NOTE" | json_escape)"},
+    {"name":"smart","status":"$SMART_STATUS","value":"$(command -v smartctl >/dev/null 2>&1 && printf 'smartctl present' || printf 'smartctl missing')","note":"$(printf '%s' "$SMART_NOTE" | json_escape)"},
+    {"name":"nic","status":"$NIC_STATUS","value":"$(printf '%s' "${NIC_LIST:-none}" | json_escape)","note":"$(printf '%s' "$NIC_NOTE" | json_escape)"},
+    {"name":"nic_link","status":"$NIC_LINK_STATUS","value":"$(printf '%s' "${NIC_LINK_DETAIL:-none}" | json_escape)","note":"$(printf '%s' "$NIC_LINK_NOTE" | json_escape)"},
+    {"name":"serial","status":"$SERIAL_STATUS","value":"$(printf '%s' "${SERIAL_LIST:-none}" | json_escape)","note":"$(printf '%s' "$SERIAL_NOTE" | json_escape)"},
+    {"name":"usb","status":"$USB_STATUS","value":"$(printf '%s' "${USB_LIST:-unavailable}" | json_escape)","note":"$(printf '%s' "$USB_NOTE" | json_escape)"},
+    {"name":"boot_mode","status":"$BOOT_STATUS","value":"$BOOT_MODE","note":"$(printf '%s' "$BOOT_NOTE" | json_escape)"},
+    {"name":"secure_boot","status":"$SECURE_BOOT_STATUS","value":"$SECURE_BOOT","note":"$(printf '%s' "$SECURE_BOOT_NOTE" | json_escape)"},
+    {"name":"tpm","status":"$TPM_STATUS","value":"$(if [[ -e /dev/tpm0 || -e /dev/tpmrm0 ]]; then printf 'present'; else printf 'absent'; fi)","note":"$(printf '%s' "$TPM_NOTE" | json_escape)"},
+    {"name":"virt","status":"$VIRT_STATUS","value":"$(printf '%s' "$VIRT_TYPE" | json_escape)","note":"$(printf '%s' "$VIRT_NOTE" | json_escape)"},
+    {"name":"cpu_virt","status":"$CPU_VIRT_STATUS","value":"$(if [[ "$CPU_VIRT_STATUS" == "SUPPORTED" ]]; then printf 'vmx/svm'; else printf 'not exposed'; fi)","note":"$(printf '%s' "$CPU_VIRT_NOTE" | json_escape)"}
+  ]
+}
+EOF
+else
+  cat <<EOF
+# Canlı Donanım Uyumluluk Kontrolü
+
+- Genel sonuç: **$OVERALL**
+- Kapsam: yalnız okuma; kurulum, disk silme ve ağ/hizmet değişikliği yapılmaz.
+- Genel sonuç, aşağıdaki kontrollerin **en yüksek** derecesidir (en kötü tek kontrol belirler).
+
+| Kontrol | Durum | Bulgu | Not |
+|---|---|---|---|
+| Mimari | $ARCH_STATUS | $ARCH | $ARCH_NOTE |
+| RAM | $RAM_STATUS | $RAM_MB MiB | $RAM_NOTE |
+| Disk | $DISK_STATUS | $DISK_COUNT disk | $DISK_NOTE |
+| Disk tipi | $DISK_TYPE_STATUS | ${DISK_TYPE_LIST:-unavailable} | $DISK_TYPE_NOTE |
+| Disk sağlığı (SMART) | $SMART_STATUS | $(command -v smartctl >/dev/null 2>&1 && printf 'smartctl var' || printf 'smartctl yok') | $SMART_NOTE |
+| NIC | $NIC_STATUS | ${NIC_LIST:-none} | $NIC_NOTE |
+| NIC link | $NIC_LINK_STATUS | ${NIC_LINK_DETAIL:-none} | $NIC_LINK_NOTE |
+| Seri | $SERIAL_STATUS | ${SERIAL_LIST:-none} | $SERIAL_NOTE |
+| USB | $USB_STATUS | ${USB_LIST:-unavailable} | $USB_NOTE |
+| Boot modu | $BOOT_STATUS | $BOOT_MODE | $BOOT_NOTE |
+| Secure Boot | $SECURE_BOOT_STATUS | $SECURE_BOOT | $SECURE_BOOT_NOTE |
+| TPM | $TPM_STATUS | $(if [[ -e /dev/tpm0 || -e /dev/tpmrm0 ]]; then printf 'present'; else printf 'absent'; fi) | $TPM_NOTE |
+| Sanallaştırma | $VIRT_STATUS | $VIRT_TYPE | $VIRT_NOTE |
+| CPU virt. | $CPU_VIRT_STATUS | $(if [[ "$CPU_VIRT_STATUS" == "SUPPORTED" ]]; then printf 'vmx/svm'; else printf 'not exposed'; fi) | $CPU_VIRT_NOTE |
+
+## Eşikler
+
+| Kontrol | BLOCKED | WARNING | SUPPORTED |
+|---|---|---|---|
+| Mimari | x86_64 dışı | — | x86_64 |
+| RAM | < 2048 MiB | 2048–4095 MiB | ≥ 4096 MiB |
+| Disk | ≥ 64 GiB disk yok | — | ≥ 64 GiB disk var |
+| Disk tipi | — | yalnız döner disk (HDD) | SSD veya karışık/bilinmiyor |
+| Disk sağlığı | SMART FAILED | smartctl yok / sonuç okunamadı | SMART PASSED |
+| NIC | non-loopback arayüz yok | — | ≥ 1 arayüz |
+| NIC link | — | hiçbir arayüz UP değil | ≥ 1 arayüz UP |
+| Seri | — | hiç seri aygıt yok | ttyS/ttyUSB/ttyACM var |
+| USB | — | lsusb yok/boş | aygıt listesi var |
+| Boot modu | — | Legacy BIOS | UEFI |
+| Secure Boot | — | UEFI'de durum okunamadı | enabled/disabled/N/A |
+| TPM | — | — | present/absent (envanter alanı) |
+| Sanallaştırma | — | hypervisor içinde | bare metal |
+| CPU virt. | — | vmx/svm yok | vmx/svm var |
+
+BLOCKED: geçiş kurulumu başlatma; donanımı gözden geçir. WARNING: LAB/periferik kabulü tamamla. SUPPORTED: bu kontrolün kapsamındaki temel eşikleri geçti; 13 numaralı kabulün yerine geçmez.
+EOF
+fi

@@ -1,0 +1,30 @@
+# Blueforce Field OS - offline APT pin manifest: Docker CE
+#
+# Target release : Ubuntu 26.04 LTS, architecture amd64 (LAB confirms both)
+# Format         : one exact pin per line -> package=version   ("#" starts a comment)
+# Consumed by    : scripts/install/blueforce-install.sh --offline, which refuses to
+#                  run any package module unless every pin here is present in the
+#                  bundle lock file <repo>/packages.lock.tsv.
+#
+# UNPINNED is a sentinel, not a version. Fill it in LAB:
+#   1. acquire the reviewed .deb for the package into one local pool directory
+#   2. read the exact version:  dpkg-deb -f <file>.deb Package Version
+#   3. replace UNPINNED with that version, keeping the line shape:
+#          docker-ce=<exact version reported by dpkg-deb>
+#   4. verify with the static plan:  ../build-offline-repo.sh --dry-run-plan
+#      (it must print PLAN READY before --check or a real build is attempted)
+#
+# Rules enforced by the tooling: lower-case package names, exactly one pin per
+# package across all manifests, no inline comments, no whitespace around "=",
+# no placeholder/replace/todo tokens. Adding or removing a package is a contract
+# change: update manifests/requirements.tsv in the same edit or the plan fails.
+
+# These packages are NOT in the Ubuntu archive: they come from the reviewed Docker
+# CE repository snapshot and must be supplied as local .deb files. containerd.io is
+# the runtime bundled with Docker CE, not Ubuntu's "containerd" package.
+# Installer module 10-docker.sh installs exactly this set in --offline mode.
+docker-ce=UNPINNED
+docker-ce-cli=UNPINNED
+containerd.io=UNPINNED
+docker-buildx-plugin=UNPINNED
+docker-compose-plugin=UNPINNED

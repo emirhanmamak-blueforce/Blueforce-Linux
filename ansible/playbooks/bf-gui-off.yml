@@ -1,0 +1,42 @@
+---
+# Disable the GUI for a confirmed maintenance wave (kiosk/headless mode).
+# Dry run: ansible-playbook -i inventory/hosts.yml playbooks/bf-gui-off.yml -e operation_wave=lab -e operation_confirmed=true --check
+- name: Disable graphical target
+  hosts: "{{ operation_wave | default('invalid-wave', true) }}"
+  gather_facts: false
+  become: true
+  vars:
+    approved_operation_waves: [lab, pilot_1, pilot_2, wave_1, wave_2, production]
+    production_override: false
+  pre_tasks:
+    - name: Require confirmed approved operation wave scope
+      ansible.builtin.assert:
+        that:
+          - operation_wave in approved_operation_waves
+          - operation_confirmed | bool
+          - operation_wave in groups
+          - ansible_play_hosts_all | length > 0
+          - ansible_play_hosts_all | difference(groups[operation_wave]) | length == 0
+        fail_msg: "Set operation_wave to one inventory wave and operation_confirmed=true; full-fleet scope is refused."
+      run_once: true
+
+    - name: Require separate production override
+      ansible.builtin.assert:
+        that:
+          - operation_wave != 'production' or production_override | bool
+        fail_msg: "Production operation requires production_override=true in addition to operation_confirmed=true."
+      run_once: true
+  tasks:
+    - name: Read current default target
+      ansible.builtin.command: systemctl get-default
+      register: current_default_target
+      changed_when: false
+
+    - name: Set default target to multi-user
+      ansible.builtin.command: systemctl set-default multi-user.target
+      when: current_default_target.stdout != 'multi-user.target'
+
+    - name: Stop graphical target now
+      ansible.builtin.systemd:
+        name: graphical.target
+        state: stopped

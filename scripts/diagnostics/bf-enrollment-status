@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+#
+# bf-enrollment-status - read-only canonical Field OS lifecycle view.
+#
+# Lifecycle contract (docs/29-DEVICE-ENROLLMENT.md, provisioning/enrollment/README.md):
+#
+#   PROVISIONED_OFFLINE  local (offline) provisioning is complete. No internet,
+#                        no central record and no WireGuard handshake is needed
+#                        or claimed at this stage.
+#   ENROLLED             central accepted the device, a WireGuard peer was
+#                        assigned and monitoring/inventory/remote access
+#                        configuration is applied (or being applied).
+#   READY                local health plus every central channel (monitoring,
+#                        remote, management) is verified.
+#
+#   Transitions are forward-only and never skip a stage:
+#     (none) -> PROVISIONED_OFFLINE -> ENROLLED -> READY
+#   A missing stage, a backwards move, or READY without verified central
+#   evidence is reported as INVALID and exits non-zero (fail closed).
+#
+# State file: ${BF_STATE_FILE:-/var/lib/blueforce/state.json}
+#   mode 0600; fields phase, enrollment_status, fleet_status, device_id,
+#   provisioning_id. Unknown extra fields are preserved by writers and ignored
+#   here.
+#
+# Output vocabulary (stable, consumed by bf-status/bf-check-*):
+#   Lifecycle  : PROVISIONED_OFFLINE | ENROLLED | READY | PENDING | INVALID
+#   Enrollment : PENDING | ENROLLED | COMPLETE
+#   Fleet      : PENDING | NOT_READY | READY
+#
+# Exit status: 0 lifecycle valid, 1 missing/invalid state, 2 usage error.
+# Never writes anything and never prints secrets.
+#
+set -euo pipefail
+
+STATE_FILE="${BF_STATE_FILE:-${STATE_DIR:-/var/lib/blueforce}/state.json}"
+# Canonical lifecycle phases; the order in this list is the only legal order.
+VALID_STATES='PROVISIONED_OFFLINE ENROLLED READY'
+FIELD='all'
+
+usage() {
+    cat <<'EOF'
+Usage: bf-enrollment-status [--field phase|enrollment|fleet] [--check]
+
+Print the canonical Field OS lifecycle state (read-only, no secrets).
+
+Options:
+  --field NAME   print one bare value instead of the three-line report
+                 (NAME is phase, enrollment or fleet)
+  --check        accepted for symmetry with the installer modules; this
+                 command never mutates anything
+  --help         show this help
+
+Exit status: 0 valid lifecycle, 1 missing or contract-violating state,
+2 usage error.
+
+Lifecycle vocabulary : PROVISIONED_OFFLINE | ENROLLED | READY | PENDING | INVALID
+Enrollment vocabulary: PENDING | ENROLLED | COMPLETE
+Fleet vocabulary     : PENDING | NOT_READY | READY
+
+Forward-only transitions: PROVISIONED_OFFLINE -> ENROLLED -> READY.
+EOF
+}
+
+if [[ "${1:-}" == '--help' || "${1:-}" == '-h' ]]; then
+    usage
+    exit 0
+fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --field)
+            [[ $# -ge 2 ]] || { echo 'ERROR: --field needs a value' >&2; exit 2; }
+            FIELD="$2"
+            shift 2
+            ;;
+        --check)
+            shift
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+case "$FIELD" in
+    all|phase|enrollment|fleet) ;;
+    *) echo "ERROR: --field must be phase, enrollment or fleet (got: $FIELD)" >&2; exit 2 ;;
+esac
+
+if [[ ! -r "$STATE_FILE" ]]; then
+    # No lifecycle state yet: the device has not completed offline provisioning.
+    if [[ "$FIELD" == 'all' ]]; then
+        printf 'Lifecycle: PENDING\nEnrollment: PENDING\nFleet: PENDING\n'
+    else
+        printf 'PENDING\n'
+    fi
+    exit 1
+fi
+
+python3 - "$STATE_FILE" "$FIELD" <<'PY'
+import json
+import os
+import re
+import stat
+import sys
+
+path, field = sys.argv[1], sys.argv[2]
+VALID_STATES = ('PROVISIONED_OFFLINE', 'ENROLLED', 'READY')
+VALID_ENROLLMENT = ('PENDING', 'ENROLLED', 'COMPLETE')
+VALID_FLEET = ('PENDING', 'NOT_READY', 'READY')
+CHANNELS = ('monitoring', 'remote', 'management')
+DEVICE_ID = re.compile(r'^BF-[0-9]{8}$')
+
+
+def invalid(reason):
+    sys.stderr.write('INVALID: %s\n' % reason)
+    print('INVALID' if field != 'all' else 'Lifecycle: INVALID')
+    raise SystemExit(1)
+
+
+try:
+    with open(path, encoding='utf-8') as handle:
+        state = json.load(handle)
+except OSError as error:
+    invalid('state file is unreadable (%s)' % error.__class__.__name__)
+except ValueError as error:
+    invalid('state file is not valid JSON (%s)' % error.__class__.__name__)
+if not isinstance(state, dict):
+    invalid('state file is not a JSON object')
+
+phase = state.get('phase')
+if phase not in VALID_STATES:
+    invalid('phase is missing or not one of %s' % ', '.join(VALID_STATES))
+enrollment = state.get('enrollment_status')
+if enrollment not in VALID_ENROLLMENT:
+    invalid('enrollment_status is missing or not one of %s' % ', '.join(VALID_ENROLLMENT))
+fleet = state.get('fleet_status')
+if fleet not in VALID_FLEET:
+    invalid('fleet_status is missing or not one of %s' % ', '.join(VALID_FLEET))
+device_id = state.get('device_id')
+if not isinstance(device_id, str) or not DEVICE_ID.match(device_id):
+    invalid('device_id is missing or does not match BF-<8 digits>')
+provisioning_id = state.get('provisioning_id')
+if not isinstance(provisioning_id, str) or not provisioning_id or len(provisioning_id) > 128 \
+        or any(character.isspace() for character in provisioning_id):
+    invalid('provisioning_id is missing or malformed')
+
+
+def evidence_problem(record):
+    """Return a reason string when central verification evidence is unusable."""
+    if not isinstance(record, dict):
+        return 'central_verification is missing'
+    if set(record) - {'status', 'verification_id', 'monitoring', 'remote', 'management'}:
+        return 'central_verification carries unexpected fields'
+    if not {'status', 'verification_id'}.issubset(record):
+        return 'central_verification is incomplete'
+    if record['status'] not in ('pending', 'verified'):
+        return 'central_verification.status is invalid'
+    if not isinstance(record['verification_id'], str) or not record['verification_id']:
+        return 'central_verification.verification_id is missing'
+    for name in CHANNELS:
+        item = record.get(name)
+        if not isinstance(item, dict) or set(item) != {'status', 'verification_id'}:
+            return 'central_verification.%s is missing or malformed' % name
+        if item['status'] not in ('pending', 'verified'):
+            return 'central_verification.%s.status is invalid' % name
+        if not isinstance(item['verification_id'], str) or not item['verification_id']:
+            return 'central_verification.%s.verification_id is missing' % name
+    return None
+
+
+record = state.get('central_verification')
+problem = evidence_problem(record)
+
+if phase == 'PROVISIONED_OFFLINE':
+    if enrollment != 'PENDING':
+        invalid('PROVISIONED_OFFLINE requires enrollment_status PENDING (got %s)' % enrollment)
+    if fleet == 'READY':
+        invalid('PROVISIONED_OFFLINE cannot be fleet READY: a stage was skipped')
+    if record is not None:
+        sys.stderr.write('WARN: central_verification is present before enrollment\n')
+elif phase == 'ENROLLED':
+    if enrollment not in ('ENROLLED', 'COMPLETE'):
+        invalid('ENROLLED requires enrollment_status ENROLLED or COMPLETE (got %s)' % enrollment)
+    if fleet == 'READY':
+        invalid('ENROLLED cannot be fleet READY: fleet READY is recorded with phase READY')
+    if problem:
+        invalid(problem)
+elif phase == 'READY':
+    if enrollment not in ('ENROLLED', 'COMPLETE'):
+        invalid('READY requires a completed enrollment (got %s)' % enrollment)
+    if fleet != 'READY':
+        invalid('READY requires fleet_status READY (got %s)' % fleet)
+    if problem:
+        invalid(problem)
+    pending = [name for name in CHANNELS if record[name]['status'] != 'verified']
+    if record['status'] != 'verified' or pending:
+        invalid('READY requires verified central evidence for every channel')
+
+try:
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    if mode & 0o077:
+        sys.stderr.write('WARN: %s is mode %04o; the lifecycle contract requires 0600\n' % (path, mode))
+except OSError:
+    pass
+
+# Enrolment is reported as COMPLETE once READY is recorded: both facts come from
+# the same forward-only transition chain.
+enrollment_display = 'COMPLETE' if (phase == 'READY' or enrollment == 'COMPLETE') else enrollment
+fleet_display = 'READY' if fleet == 'READY' else 'NOT READY'
+
+if field == 'phase':
+    print(phase)
+elif field == 'enrollment':
+    print(enrollment_display)
+elif field == 'fleet':
+    print(fleet_display)
+else:
+    print('Lifecycle: ' + phase)
+    print('Enrollment: ' + enrollment_display)
+    print('Fleet: ' + fleet_display)
+PY

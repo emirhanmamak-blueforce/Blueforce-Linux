@@ -1,0 +1,4 @@
+/* Blueforce docs theme overrides. Dark mode is the default (see docusaurus.config.ts). */
+:root {
+  --ifm-color-primary: #4aa8ff;
+}

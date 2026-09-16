@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+# Blueforce Field OS first-boot entry point.
+#
+# Role: obtain the 8-digit dealer number (console wizard for a technician, or a flag/file
+# for automation), validate it, verify the offline prerequisites, run the local offline
+# installer exactly once, then stamp the completion marker.
+#
+# Every comment and identifier in this file is English. The only Turkish strings are the
+# technician-facing wizard labels, because the field console UI is Turkish.
+#
+# Guarantees:
+#   * idempotent: when the marker exists the run changes nothing and exits 0;
+#   * identity is write-once: the device identity cannot be changed through the normal
+#     path or through the wizard; changing it needs the separate admin procedure
+#     (--force-reidentity), which stays disabled unless BF_ALLOW_REIDENTITY=1;
+#   * fail-closed: an invalid dealer number, a missing terminal, or an unacceptable
+#     administrator public key aborts with an explicit message and a non-zero exit;
+#   * no secret material is ever printed, logged, or copied. Only key paths, never key
+#     content, are used in messages.
+set -euo pipefail
+
+PROG='bf-firstboot'
+DEALER_ID_RE='^[0-9]{8}$'
+DEFAULT_DEALER_FILE='/etc/blueforce/dealer-id'
+DEFAULT_ADMIN_KEY_FILE='/etc/blueforce/admin-authorized-key.pub'
+DEFAULT_MARKER='/var/lib/blueforce/firstboot-complete'
+DEFAULT_INSTALLER='/usr/local/sbin/blueforce-install.sh'
+AUDIT_LOG="${BF_REIDENTITY_AUDIT_LOG:-/var/log/blueforce-reidentity.log}"
+
+MARKER="${BF_FIRSTBOOT_MARKER:-$DEFAULT_MARKER}"
+STATE_DIR="${STATE_DIR:-/var/lib/blueforce}"
+INPUT_TIMEOUT="${BF_FIRSTBOOT_INPUT_TIMEOUT:-300}"
+MAX_ATTEMPTS="${BF_FIRSTBOOT_MAX_ATTEMPTS:-3}"
+
+DEALER_ID=''
+DEALER_FILE="$DEFAULT_DEALER_FILE"
+DEALER_FILE_GIVEN=0
+CHECK_ONLY=0
+FORCE_REIDENTITY=0
+FORCED_INTERACTIVE=0
+NONINTERACTIVE="${BF_FIRSTBOOT_NONINTERACTIVE:-0}"
+TTY_FD=''
+WIZ_OUT_FD='1'
+INSTALLER=''
+KEY_FILE=''
+
+usage() {
+  cat <<'EOF'
+Usage: bf-firstboot [--dealer-id 8DIGITS] [--dealer-id-file PATH]
+                    [--interactive] [--non-interactive] [--check]
+
+Interactive (default when a console is present): the wizard prints the field console
+banner, asks for the 8-digit dealer number, shows the resulting Device ID and hostname,
+and asks for confirmation before anything is installed.
+
+Automation: --dealer-id or --dealer-id-file (or BF_FIRSTBOOT_NONINTERACTIVE=1 with the
+seeded dealer id file) never prompts, so the offline installer can run unattended.
+
+  --check             validate the inputs and report; creates no state and no marker
+  --interactive       force the wizard, even when a seeded dealer id file exists
+  --non-interactive   never prompt; use --dealer-id-file or the seeded dealer id file
+
+Identity changes are not part of this command. They use the separate admin-only
+--force-reidentity path, which is documented in provisioning/firstboot/README.md and
+stays disabled unless BF_ALLOW_REIDENTITY=1 is set by an operator at the console.
+EOF
+}
+
+# Every message carries dealer ids, device ids and paths only. Secret material (key
+# contents, tokens, passwords) is never formatted into them, so printing them is safe.
+# The systemd unit sends stdout/stderr to the console TTY, so each line is also mirrored
+# to the journal through logger when that tool is present.
+journal() {
+  command -v logger >/dev/null 2>&1 || return 0
+  printf '%s [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PROG" "$*" | logger -t "$PROG" 2>/dev/null || true
+}
+log() { printf '%s [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PROG" "$*"; journal "$*"; }
+warn() { printf '%s [%s] WARNING: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PROG" "$*" >&2; journal "WARNING: $*"; }
+err() { printf '%s [%s] ERROR: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PROG" "$*" >&2; journal "ERROR: $*"; }
+
+bf_device_id() { printf 'BF-%s' "$1"; }
+bf_hostname() { printf 'bf-%s' "$1"; }
+valid_dealer_id() { [[ "$1" =~ $DEALER_ID_RE ]]; }
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dealer-id)
+        [[ -n "${2:-}" ]] || { err '--dealer-id needs a value: exactly 8 digits'; usage >&2; exit 2; }
+        DEALER_ID="$2"; shift 2;;
+      --dealer-id-file)
+        [[ -n "${2:-}" ]] || { err '--dealer-id-file needs a path'; usage >&2; exit 2; }
+        DEALER_FILE="$2"; DEALER_FILE_GIVEN=1; shift 2;;
+      --check) CHECK_ONLY=1; shift;;
+      --force-reidentity) FORCE_REIDENTITY=1; shift;;
+      --interactive) FORCED_INTERACTIVE=1; shift;;
+      --non-interactive) NONINTERACTIVE=1; shift;;
+      --help|-h) usage; exit 0;;
+      *) err "unknown argument: $1"; usage >&2; exit 2;;
+    esac
+  done
+  [[ "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || { err 'BF_FIRSTBOOT_MAX_ATTEMPTS must be a positive integer'; exit 2; }
+  [[ "$INPUT_TIMEOUT" =~ ^[0-9]+$ ]] || { err 'BF_FIRSTBOOT_INPUT_TIMEOUT must be a number of seconds'; exit 2; }
+  [[ "$NONINTERACTIVE" == 0 || "$NONINTERACTIVE" == 1 ]] || { err 'BF_FIRSTBOOT_NONINTERACTIVE must be 0 or 1'; exit 2; }
+}
+
+read_dealer_id_file() {
+  local path="$1" value
+  [[ -f "$path" && -r "$path" ]] || { err "dealer id file is missing or unreadable: $path"; exit 2; }
+  value="$(tr -d '[:space:]' < "$path" || true)"
+  [[ -n "$value" ]] || { err "dealer id file is empty: $path"; exit 2; }
+  printf '%s' "$value"
+}
+
+marker_exists() { [[ -e "$MARKER" ]]; }
+
+marker_device_id() {
+  [[ -f "$MARKER" ]] || return 0
+  tr -d '[:space:]' < "$MARKER" || true
+}
+
+write_marker() {
+  local tmp
+  install -d -m 700 "$(dirname "$MARKER")"
+  tmp="$MARKER.tmp.$$"
+  printf '%s\n' "$DEALER_ID" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$MARKER"
+  log "marker written: $MARKER (device $(bf_device_id "$DEALER_ID"))"
+}
+
+# Attach the wizard to a terminal. stdin is used when it already is a terminal (this is
+# the systemd StandardInput=tty-force case); otherwise /dev/tty is opened, and when that
+# fails too the caller falls back to the automation input path.
+open_tty() {
+  if [[ -t 0 ]]; then TTY_FD=0; WIZ_OUT_FD=1; return 0; fi
+  if { exec 3<>/dev/tty; } 2>/dev/null; then TTY_FD=3; WIZ_OUT_FD=3; return 0; fi
+  return 1
+}
+
+require_tty() {
+  open_tty && return 0
+  err 'a terminal is required for the interactive wizard, but none is available; pass --dealer-id or --dealer-id-file instead'
+  exit 2
+}
+
+wizard_out() { printf '%s\n' "$*" >&"$WIZ_OUT_FD"; }
+wizard_write() { printf '%s' "$*" >&"$WIZ_OUT_FD"; }
+
+wizard_read() {
+  local __name="$1" __value=''
+  read -r -t "$INPUT_TIMEOUT" -u "$TTY_FD" __value || return 1
+  printf -v "$__name" '%s' "${__value%$'\r'}"
+}
+
+# Trim surrounding whitespace only: a pasted value keeps working, while any other
+# deviation from the 8-digit identity is rejected and asked again.
+trim_space() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+# Interactive identity collection. A malformed number or a refused confirmation is never
+# accepted: after MAX_ATTEMPTS the run aborts without changing anything.
+wizard_collect() {
+  local attempt=1 line answer
+  wizard_out '# BLUEFORCE FIELD OS'
+  while (( attempt <= MAX_ATTEMPTS )); do
+    wizard_out '8 Haneli Bayi Numarası:'
+    wizard_write '> '
+    if ! wizard_read line; then
+      err 'no terminal input arrived (timed out); first boot aborted without changes'
+      exit 2
+    fi
+    wizard_out ''
+    line="$(trim_space "$line")"
+    if valid_dealer_id "$line"; then
+      wizard_out "Device ID (cihaz kimliği): $(bf_device_id "$line")"
+      wizard_out "Hostname (makine adı)   : $(bf_hostname "$line")"
+      wizard_write "Kurulum bu kimlikle başlatılsın mı? [e/H]: "
+      if ! wizard_read answer; then
+        err 'no terminal input arrived (timed out); first boot aborted without changes'
+        exit 2
+      fi
+      wizard_out ''
+      if [[ "$answer" =~ ^([eE]|[eE]vet|y|Y|yes|YES)$ ]]; then
+        DEALER_ID="$line"
+        log "dealer number accepted at the console as $(bf_device_id "$DEALER_ID") on $(bf_hostname "$DEALER_ID")"
+        return 0
+      fi
+      wizard_out "Onay verilmedi; yeniden soruluyor. (deneme $attempt/$MAX_ATTEMPTS)"
+    else
+      wizard_out "Geçersiz giriş; 8 hane rakam gerekli. (deneme $attempt/$MAX_ATTEMPTS)"
+    fi
+    attempt=$((attempt + 1))
+  done
+  err "dealer number was not accepted after $MAX_ATTEMPTS attempts; first boot aborted without changes"
+  exit 2
+}
+
+# Identity resolution order: explicit flag, explicit file, forced wizard, explicit
+# non-interactive mode, seeded dealer id file, wizard, hard failure.
+resolve_dealer_id() {
+  local value
+  if [[ -n "$DEALER_ID" ]]; then
+    log 'dealer number supplied on the command line (non-interactive)'
+    return 0
+  fi
+  if [[ "$DEALER_FILE_GIVEN" == 1 ]]; then
+    DEALER_ID="$(read_dealer_id_file "$DEALER_FILE")"
+    log "dealer number read from $DEALER_FILE (non-interactive)"
+    return 0
+  fi
+  if [[ "$FORCED_INTERACTIVE" == 1 ]]; then
+    require_tty
+    wizard_collect
+    return 0
+  fi
+  if [[ "$NONINTERACTIVE" == 1 ]]; then
+    DEALER_ID="$(read_dealer_id_file "$DEALER_FILE")"
+    log "non-interactive mode: dealer number read from $DEALER_FILE"
+    return 0
+  fi
+  if [[ -f "$DEALER_FILE" && -r "$DEALER_FILE" ]]; then
+    value="$(tr -d '[:space:]' < "$DEALER_FILE" || true)"
+    if valid_dealer_id "$value"; then
+      DEALER_ID="$value"
+      log "seeded dealer id file used: $DEALER_FILE (wizard skipped)"
+      return 0
+    fi
+    warn "seeded dealer id file exists but is not acceptable: $DEALER_FILE"
+  fi
+  if open_tty; then
+    wizard_collect
+    return 0
+  fi
+  err "no terminal is available for the wizard and no dealer number was supplied; pass --dealer-id, --dealer-id-file, or seed $DEALER_FILE"
+  exit 2
+}
+
+require_dealer_id() {
+  [[ -n "$DEALER_ID" ]] || { err 'a dealer number is required (8 digits)'; exit 2; }
+  valid_dealer_id "$DEALER_ID" || { err 'invalid dealer number: exactly 8 digits are required'; exit 2; }
+}
+
+# The administrator public key is a mandatory offline prerequisite. Only a public key in
+# a root-owned, not group/world writable file is accepted; private or inline key material
+# is refused and never echoed.
+validate_admin_key() {
+  KEY_FILE="${BF_ADMIN_PUBLIC_KEY_FILE:-}"
+  if [[ -z "$KEY_FILE" && -r "$DEFAULT_ADMIN_KEY_FILE" ]]; then KEY_FILE="$DEFAULT_ADMIN_KEY_FILE"; fi
+  [[ -n "$KEY_FILE" && -f "$KEY_FILE" && -r "$KEY_FILE" ]] || { echo 'OFFLINE BLOCKED: seed-provided BF_ADMIN_PUBLIC_KEY_FILE is required.' >&2; exit 1; }
+  [[ "$(stat -c '%U:%a' "$KEY_FILE")" =~ ^root:6[04]0$ ]] || { echo 'OFFLINE BLOCKED: administrator public-key file must be root-owned and not group/world writable.' >&2; exit 1; }
+  grep -qE '^(ssh-(ed25519|rsa|ecdsa)|sk-ssh-ed25519)' "$KEY_FILE" && ! grep -q 'PRIVATE KEY' "$KEY_FILE" || { echo 'OFFLINE BLOCKED: BF_ADMIN_PUBLIC_KEY_FILE must contain only a public SSH key.' >&2; exit 1; }
+  export BF_ADMIN_PUBLIC_KEY_FILE="$KEY_FILE"
+  log "administrator public key file accepted: $KEY_FILE"
+}
+
+resolve_installer() {
+  INSTALLER="${BF_INSTALLER_PATH:-$DEFAULT_INSTALLER}"
+  if [[ ! -x "$INSTALLER" ]]; then
+    INSTALLER="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../scripts/install" 2>/dev/null && pwd || true)/blueforce-install.sh"
+  fi
+  [[ -x "$INSTALLER" ]] || { err "offline installer is unavailable: $INSTALLER"; exit 1; }
+  log "offline installer: $INSTALLER"
+}
+
+# The installer is always called offline with the validated dealer number and --yes,
+# because this script already obtained the operator decision (wizard) or runs in an
+# explicitly requested automation mode. A previous partial run is resumed.
+run_installer() {
+  local -a args=(--offline --dealer-id "$DEALER_ID" --yes)
+  if [[ -s "$STATE_DIR/install-state" ]]; then
+    args+=(--resume)
+    log "partial install state found in $STATE_DIR/install-state; resuming instead of restarting"
+  fi
+  if [[ "${BF_FIRSTBOOT_TEST_MODE:-0}" == 1 ]]; then
+    echo "TEST: would run $INSTALLER ${args[*]}"
+    exit 0
+  fi
+  "$INSTALLER" "${args[@]}"
+}
+
+audit_log() {
+  local message="$1"
+  install -d -m 700 "$(dirname "$AUDIT_LOG")" 2>/dev/null || true
+  printf '%s uid=%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(id -u)" "$message" >> "$AUDIT_LOG" || {
+    err "identity change refused: audit log is not writable ($AUDIT_LOG)"
+    return 1
+  }
+  chmod 600 "$AUDIT_LOG" 2>/dev/null || true
+  log "AUDIT: $message"
+}
+
+# Admin/recovery path for changing the device identity. Disabled by default: it needs
+# root, the BF_ALLOW_REIDENTITY=1 operator gate, a warning, a typed confirmation of the
+# new dealer number, and a written audit record. The normal path and the wizard never
+# reach this function.
+reidentity() {
+  local existing new_id typed stamp
+  existing="$(marker_device_id)"
+  [[ "$(id -u)" -eq 0 ]] || { err '--force-reidentity is an administrative procedure and requires root'; exit 1; }
+  [[ "${BF_ALLOW_REIDENTITY:-0}" == 1 ]] || {
+    err 'identity change is disabled by default; an operator must set BF_ALLOW_REIDENTITY=1 and run --force-reidentity from the console as root'
+    exit 1
+  }
+  resolve_dealer_id
+  require_dealer_id
+  new_id="$DEALER_ID"
+  warn 'IDENTITY CHANGE: this machine will be re-identified and re-provisioned.'
+  warn "old identity: ${existing:-<none>}  new identity: $(bf_device_id "$new_id") / $(bf_hostname "$new_id")"
+  warn 'All nine central systems that carry the identity must be updated after this step.'
+  require_tty
+  wizard_out ''
+  wizard_out "DİKKAT: kimlik değişimi. Eski: ${existing:-yok}  Yeni: $(bf_device_id "$new_id")"
+  wizard_write "Onaylamak için yeni bayi numarasını yeniden yazın: "
+  if ! wizard_read typed; then
+    err 'no terminal input arrived (timed out); identity change aborted without changes'
+    exit 2
+  fi
+  wizard_out ''
+  typed="$(trim_space "$typed")"
+  [[ "$typed" == "$new_id" ]] || { err 'confirmation did not match; identity change aborted without changes'; exit 2; }
+
+  audit_log "identity-change requested old=${existing:-none} new=$(bf_device_id "$new_id")" || exit 1
+  validate_admin_key
+  resolve_installer
+  run_installer
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  if [[ -f "$MARKER" ]]; then
+    cp -p "$MARKER" "$MARKER.reidentified-$stamp" || true
+    chmod 600 "$MARKER.reidentified-$stamp" 2>/dev/null || true
+  fi
+  write_marker
+  audit_log "identity-change applied old=${existing:-none} new=$(bf_device_id "$new_id") marker-archive=$MARKER.reidentified-$stamp"
+  log "identity change complete; update the remaining central systems before the device is used"
+}
+
+main() {
+  local existing
+  parse_args "$@"
+
+  # Check mode is read-only: it never prompts, never writes state, and never installs.
+  if [[ "$CHECK_ONLY" == 1 ]]; then
+    if marker_exists; then
+      existing="$(marker_device_id)"
+      log "check: first boot already completed${existing:+ for $existing}; nothing would change"
+      exit 0
+    fi
+    if [[ -z "$DEALER_ID" ]]; then
+      if [[ -f "$DEALER_FILE" && -r "$DEALER_FILE" ]]; then
+        DEALER_ID="$(read_dealer_id_file "$DEALER_FILE")"
+      else
+        err 'check mode needs a dealer number: pass --dealer-id or --dealer-id-file (no prompt is used in check mode)'
+        exit 2
+      fi
+    fi
+    require_dealer_id
+    log "check: dealer number $(bf_device_id "$DEALER_ID") is acceptable on $(bf_hostname "$DEALER_ID"); no changes were made"
+    exit 0
+  fi
+
+  # Idempotency: a stamped device is finished. Nothing is prompted, written, or installed.
+  if marker_exists && [[ "$FORCE_REIDENTITY" != 1 ]]; then
+    existing="$(marker_device_id)"
+    log "first boot already completed${existing:+ for $existing}; nothing to do"
+    if [[ -n "$DEALER_ID" && -n "$existing" && "$DEALER_ID" != "$existing" ]]; then
+      warn "requested dealer number differs from the provisioned identity ($existing); identity changes use the admin procedure described in provisioning/firstboot/README.md"
+    fi
+    exit 0
+  fi
+
+  if [[ "$FORCE_REIDENTITY" == 1 ]]; then
+    reidentity
+    exit 0
+  fi
+
+  resolve_dealer_id
+  require_dealer_id
+  [[ "$(id -u)" -eq 0 ]] || { err 'first boot provisioning must run as root'; exit 1; }
+  validate_admin_key
+  resolve_installer
+  run_installer
+  write_marker
+  log "first boot finished for $(bf_device_id "$DEALER_ID"); enrollment and READY are separate steps"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

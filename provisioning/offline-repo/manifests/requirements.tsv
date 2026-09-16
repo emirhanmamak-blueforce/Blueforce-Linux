@@ -1,0 +1,34 @@
+# Manifest audit table - the contract behind manifests/*.txt
+#
+# Four TAB-separated columns, one row per required package:
+#   manifest <TAB> package <TAB> required-by <TAB> why
+#
+# build-offline-repo.sh --dry-run-plan fails on drift in either direction:
+#   * a row whose package is not pinned in that manifest -> MISSING PACKAGES
+#   * a pin in a manifest with no row here               -> PLAN ERROR (rogue pin)
+#
+# scripts/install/blueforce-install.sh never reads this file: it is the audit
+# trail for humans and for the dry-run plan. Kernel modules and other artifacts
+# that are not shipped as .deb files are out of scope.
+base-packages.txt	curl	scripts/install/installer/modules/02-system.sh	BASE_PKGS: HTTPS transfers for installer tooling
+base-packages.txt	wget	scripts/install/installer/modules/02-system.sh	BASE_PKGS: downloader expected by field runbooks
+base-packages.txt	ca-certificates	scripts/install/installer/modules/02-system.sh	BASE_PKGS: root store for TLS verification
+base-packages.txt	gnupg	scripts/install/installer/modules/02-system.sh	BASE_PKGS: signature handling for reviewed artifacts
+base-packages.txt	lsb-release	scripts/install/installer/modules/02-system.sh	BASE_PKGS: distribution identification
+base-packages.txt	apt-transport-https	scripts/install/installer/modules/02-system.sh	BASE_PKGS-adjacent: transitional dummy on apt >= 2.0, kept for parity
+base-packages.txt	openssh-server	scripts/install/installer/modules/07-ssh.sh	managed SSH access channel
+base-packages.txt	wireguard-tools	scripts/install/installer/modules/06-wireguard.sh	wg command for the WireGuard tunnel
+base-packages.txt	smartmontools	scripts/diagnostics/bf-diagnostics	SMART disk health evidence for field reports
+base-packages.txt	ufw	scripts/install/installer/modules/13-firewall.sh	host firewall baseline
+base-packages.txt	iptables	scripts/install/installer/modules/13-firewall.sh	rule backends used by the firewall module
+base-packages.txt	prometheus-node-exporter	scripts/install/installer/modules/12-monitoring.sh	node exporter including the textfile collector
+remote-access.txt	rustdesk	scripts/install/installer/modules/09-rustdesk.sh	pinned vendor .deb; not in the Ubuntu archive
+remote-access.txt	xrdp	scripts/install/installer/modules/08-rdp.sh	RDP access channel
+remote-access.txt	xorgxrdp	scripts/install/installer/modules/08-rdp.sh	X11 backend recommended by xrdp for the GNOME session
+remote-access.txt	gnome-session	scripts/install/installer/modules/08-rdp.sh	session started by xRDP logins
+remote-access.txt	ubuntu-desktop-minimal	scripts/install/installer/modules/16-gui.sh	minimal desktop stack for the field device
+docker.txt	docker-ce	scripts/install/installer/modules/10-docker.sh	container engine
+docker.txt	docker-ce-cli	scripts/install/installer/modules/10-docker.sh	docker CLI used by modules and diagnostics
+docker.txt	containerd.io	scripts/install/installer/modules/10-docker.sh	runtime bundled with Docker CE
+docker.txt	docker-buildx-plugin	scripts/install/installer/modules/10-docker.sh	buildx plugin requested by the offline install path
+docker.txt	docker-compose-plugin	scripts/install/installer/modules/10-docker.sh	compose v2 plugin for the field stack

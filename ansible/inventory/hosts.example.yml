@@ -1,0 +1,54 @@
+# Blueforce fleet inventory (EXAMPLE - copy to hosts.yml and fill real IDs).
+# Naming: bf-<8-digit-dealer-no> per docs/02-DEVICE-NAMING-AND-INVENTORY.md.
+# Targeting levels per docs/09-FLEET-MANAGEMENT.md: single host -> group -> pilot wave -> full fleet.
+# Waves per docs/10-UPDATE-AND-ROLLBACK-POLICY.md: lab(2)/pilot_1(5)/pilot_2(20)/wave_1(50)/wave_2(100)/production.
+all:
+  children:
+    blueforce:
+      children:
+        lab:
+          hosts:
+            bf-12010101:
+              ansible_host: 10.42.0.11
+            bf-12010102:
+              ansible_host: 10.42.0.12
+        pilot_1:
+          hosts:
+            bf-12010201:
+              ansible_host: 10.42.1.11
+            bf-12010202:
+              ansible_host: 10.42.1.12
+            bf-12010203:
+              ansible_host: 10.42.1.13
+            bf-12010204:
+              ansible_host: 10.42.1.14
+            bf-12010205:
+              ansible_host: 10.42.1.15
+        pilot_2:
+          hosts:
+            bf-12010301:
+              ansible_host: 10.42.2.11
+            bf-12010302:
+              ansible_host: 10.42.2.12
+        wave_1:
+          hosts:
+            bf-12010401:
+              ansible_host: 10.42.3.11
+            bf-12010402:
+              ansible_host: 10.42.3.12
+        wave_2:
+          hosts:
+            bf-12010501:
+              ansible_host: 10.42.4.11
+            bf-12010502:
+              ansible_host: 10.42.4.12
+        production:
+          hosts:
+            bf-12010601:
+              ansible_host: 10.42.5.11
+            bf-12010602:
+              ansible_host: 10.42.5.12
+      vars:
+        ansible_user: blueforce
+        ansible_ssh_private_key_file: ~/.ssh/blueforce_id_ed25519  # PLACEHOLDER: set per-admin key path (see docs/06)
+        ansible_python_interpreter: /usr/bin/python3

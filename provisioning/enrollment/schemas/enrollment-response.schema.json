@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Blueforce enrollment V1 response",
+  "description": "Accepted enrollment response. It carries the assigned WireGuard peer, the deterministic idempotency key and mandatory central_verification evidence references. It never carries a WireGuard private key, a credential, a URL, a RustDesk credential or any other confidential value. The device assembles its own configuration and keeps its own private key.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "device_id", "idempotency_key", "wireguard", "central_verification"],
+  "properties": {
+    "status": {
+      "const": "accepted",
+      "description": "Any other value must be treated as a rejection; the device stays PENDING."
+    },
+    "device_id": {
+      "type": "string",
+      "pattern": "^BF-[0-9]{8}$"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "Echo of the request key. A mismatch rejects the whole response."
+    },
+    "enrollment_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Central audit reference for this enrollment record."
+    },
+    "wireguard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["address", "endpoint", "server_public_key", "allowed_ips"],
+      "properties": {
+        "address": {
+          "type": "string",
+          "pattern": "^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}/(?:[0-9]|[12][0-9]|3[0-2])$",
+          "description": "Device tunnel address with prefix, for example 10.20.0.17/32."
+        },
+        "endpoint": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]*:[1-9][0-9]{0,4}$",
+          "description": "Central hub endpoint as host:port. Placeholder values are rejected locally."
+        },
+        "server_public_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9+/]{43}=$",
+          "description": "Hub public key only; a private key is never accepted here."
+        },
+        "allowed_ips": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Comma-separated tunnel routes; must be a single line."
+        }
+      }
+    },
+    "central_verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "verification_id", "monitoring", "remote", "management"],
+      "properties": {
+        "status": {"enum": ["pending", "verified"]},
+        "verification_id": {"type": "string", "minLength": 1},
+        "monitoring": {"$ref": "#/$defs/verification"},
+        "remote": {"$ref": "#/$defs/verification"},
+        "management": {"$ref": "#/$defs/verification"}
+      },
+      "description": "Central evidence references. The device never invents them: without a well-formed record the ENROLLED gate fails closed, and READY additionally requires every channel to be verified."
+    }
+  },
+  "$defs": {
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "verification_id"],
+      "properties": {
+        "status": {"enum": ["pending", "verified"]},
+        "verification_id": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

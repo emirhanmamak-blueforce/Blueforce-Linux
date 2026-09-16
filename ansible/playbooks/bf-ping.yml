@@ -1,0 +1,12 @@
+---
+# Connectivity check for the Blueforce fleet.
+# Targeting: single host -> group -> pilot wave -> full fleet (--limit).
+# Dry run first: ansible-playbook -i inventory/hosts.yml playbooks/bf-ping.yml --limit lab --check
+# Run: ansible-playbook -i inventory/hosts.yml playbooks/bf-ping.yml --limit lab
+# No changes are made by this playbook. No Semaphore Pro feature is used.
+- name: Ping fleet hosts
+  hosts: blueforce
+  gather_facts: false
+  tasks:
+    - name: Check SSH connectivity
+      ansible.builtin.ping:

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Print nonsecret release identity. Skeleton manifests are explicitly not deployable releases.
+set -euo pipefail
+if [[ -n "${BF_RELEASE_MANIFEST:-}" ]]; then MANIFEST="$BF_RELEASE_MANIFEST"
+elif [[ -r /etc/blueforce/release-manifest.yaml ]]; then MANIFEST=/etc/blueforce/release-manifest.yaml
+elif [[ -r /etc/blueforce-release ]]; then MANIFEST=/etc/blueforce-release
+else MANIFEST="$(cd "$(dirname "$0")/../.." && pwd)/provisioning/release/manifest.yaml"; fi
+[[ -r "$MANIFEST" ]] || { printf 'Field OS: unknown\nRelease status: UNKNOWN\nRelease commit: unknown\n'; exit 1; }
+python3 - "$MANIFEST" <<'PY'
+import sys
+try:
+    import yaml
+    raw=open(sys.argv[1],encoding='utf-8').read()
+    data=yaml.safe_load(raw) or {}
+    if not isinstance(data,dict):
+        # Legacy /etc/blueforce-release may be a nonsecret KEY=VALUE identity file.
+        data={}
+        for line in raw.splitlines():
+            if '=' in line:
+                key,value=line.split('=',1)
+                data[key.strip().lower()]=value.strip().strip('"')
+except Exception:
+    print('Field OS: unknown'); print('Release status: INVALID_MANIFEST'); print('Release commit: unknown'); sys.exit(1)
+r=data.get('release') if isinstance(data.get('release'),dict) else data
+name=r.get('name') or r.get('release_id') or 'unknown'
+version=r.get('version') or 'unknown'
+status=str(r.get('status') or 'unknown').lower()
+commit=r.get('commit') or r.get('installer_commit') or data.get('commit') or data.get('installer_commit') or 'unknown'
+print(f'Field OS: {name} {version}')
+if status == 'skeleton':
+    print('Release status: UNAPPROVED_SKELETON')
+    print(f'Release commit: {commit}')
+    sys.exit(1)
+print('Release status: '+status.upper())
+print(f'Release commit: {commit}')
+PY

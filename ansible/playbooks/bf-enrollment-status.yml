@@ -1,0 +1,208 @@
+---
+# Blueforce enrollment durum raporu -- READ-ONLY, dalga kapsamlı.
+# Ne yapar: her cihaz için enrollment_status + fleet_status + faz yazar; ENROLLED/READY iddiası
+#           olup merkezi doğrulama kanıtı (central_verification: status + verification_id +
+#           monitoring/remote/management kanalları) eksik olan cihazları listeler.
+#           Sözleşme: docs/29 (merkezi doğrulama yanıtı), docs/14 (bf-status).
+# Kanıt: /var/lib/blueforce/state.json ve kanonik /usr/local/bin/bf-enrollment-status çıktısı.
+# Hiçbir görev durum değiştirmez: yalnız stat/slurp ve read-only CLI çıktısı okunur; tüm
+# command görevleri changed_when: false taşır.
+# Kuru koşu: ansible-playbook -i inventory/hosts.yml playbooks/bf-enrollment-status.yml -e operation_wave=lab -e operation_confirmed=true --check
+# Koşu:      ansible-playbook -i inventory/hosts.yml playbooks/bf-enrollment-status.yml -e operation_wave=lab -e operation_confirmed=true
+# Semaphore Pro bağımlılığı yok.
+# Dalga kapısı: operation_wave + operation_confirmed (+ production_override) rapor play'inden ÖNCE,
+# hiçbir hosta dokunmadan doğrulanır; --limit dalga ile kesişmezse koşu reddedilir (fail-closed).
+- name: Dalga ve onay kapısı -- hiçbir hosta dokunmadan önce (mutasyon yok)
+  hosts: "{{ ansible_limit | default('localhost') }}"
+  gather_facts: false
+  become: false
+  vars:
+    approved_operation_waves: [lab, pilot_1, pilot_2, wave_1, wave_2, production]
+    production_override: false
+    operation_wave_gate: "{{ operation_wave | default('invalid-wave', true) }}"
+  tasks:
+    - name: Require an approved confirmed operation wave before any host is touched
+      ansible.builtin.assert:
+        that:
+          - operation_wave_gate in approved_operation_waves
+          - operation_confirmed | default(false) | bool
+          - operation_wave_gate in groups
+          - groups[operation_wave_gate] | length > 0
+          - (operation_wave_gate != 'production') or (production_override | default(false) | bool)
+        fail_msg: "operation_wave must name a non-empty approved inventory group (lab/pilot_1/pilot_2/wave_1/wave_2/production), operation_confirmed=true is required, and production additionally requires production_override=true."
+      run_once: true
+
+    - name: Require the --limit selection to intersect the declared wave
+      ansible.builtin.assert:
+        that:
+          - (((ansible_limit | default('') | split(',') | intersect(groups[operation_wave_gate]) | length) > 0)
+            or ((ansible_limit | default('') | split(',') | select('in', groups) | map('extract', groups) | flatten | unique | intersect(groups[operation_wave_gate]) | length) > 0))
+        fail_msg: "--limit selection '{{ ansible_limit }}' does not intersect the '{{ operation_wave_gate }}' wave; refusing a mis-scoped run."
+      when:
+        - (ansible_limit | default('') | length) > 0
+        - not (ansible_limit | default('') is search('[][*?]'))
+      run_once: true
+
+- name: Enrollment ve merkez kanıtı durumunu raporla (read-only)
+  hosts: "{{ operation_wave | default('invalid-wave', true) }}"
+  gather_facts: false
+  become: true  # Yalnız root sahipli kanıt dosyalarını (state.json 0600) OKUMAK için; mutasyon yok.
+  vars:
+    approved_operation_waves: [lab, pilot_1, pilot_2, wave_1, wave_2, production]
+    production_override: false
+    enrollment_state_file: /var/lib/blueforce/state.json
+    enrollment_status_bin: /usr/local/bin/bf-enrollment-status
+    enrollment_central_channels: [monitoring, remote, management]
+    enrollment_central_required_for: [ENROLLED, READY]
+  pre_tasks:
+    - name: Require confirmed approved operation wave scope
+      ansible.builtin.assert:
+        that:
+          - operation_wave in approved_operation_waves
+          - operation_confirmed | bool
+          - operation_wave in groups
+          - groups[operation_wave] | length > 0
+          - ansible_play_hosts_all | length > 0
+          - ansible_play_hosts_all | difference(groups[operation_wave]) | length == 0
+        fail_msg: "Set operation_wave to one inventory wave and operation_confirmed=true; full-fleet scope is refused."
+      run_once: true
+
+    - name: Require separate production override
+      ansible.builtin.assert:
+        that:
+          - operation_wave != 'production' or production_override | bool
+        fail_msg: "Production operation requires production_override=true in addition to operation_confirmed=true."
+      run_once: true
+  tasks:
+    - name: Enrollment kanıt yollarını denetle (read-only)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ enrollment_state_file }}"
+        - "{{ enrollment_status_bin }}"
+      register: enrollment_evidence
+
+    - name: Kanıt durumlarını yol ile indeksle
+      ansible.builtin.set_fact:
+        enrollment_evidence_by_path: "{{ enrollment_evidence.results | items2dict(key_name='item', value_name='stat') }}"
+
+    - name: Durum dosyasını oku (read-only)
+      ansible.builtin.slurp:
+        src: "{{ enrollment_state_file }}"
+      register: enrollment_state_raw
+      when:
+        - enrollment_evidence_by_path[enrollment_state_file].exists | default(false)
+        - enrollment_evidence_by_path[enrollment_state_file].size | default(0) | int > 0
+
+    - name: Kanonik enrollment durumunu oku (bf-enrollment-status, read-only)
+      ansible.builtin.command: "{{ enrollment_status_bin }}"
+      register: enrollment_status_cli
+      changed_when: false
+      failed_when: false
+      when: enrollment_evidence_by_path[enrollment_status_bin].exists | default(false)
+
+    - name: Durum dosyası içeriğini çöz (bozuk dosyada rapor PENDING kalır, koşu durmaz)
+      ansible.builtin.set_fact:
+        enrollment_state_parsed: "{{ enrollment_state_raw.content | b64decode | from_json }}"
+      when: enrollment_state_raw.content is defined
+      ignore_errors: true
+
+    - name: Enrollment alanlarını ve merkez kanıtını belirle
+      ansible.builtin.set_fact:
+        bf_enr_device_id: "{{ (enrollment_state_parsed | default({}, true)).get('device_id', inventory_hostname | upper) }}"
+        bf_enr_phase: >-
+          {{ (enrollment_state_parsed | default({}, true)).get('phase', '') | default('', true)
+             if (enrollment_state_parsed | default({}, true)).get('phase', '') in ['PROVISIONED_OFFLINE', 'ENROLLED', 'READY']
+             else 'PENDING' }}
+        bf_enr_enrollment_status: "{{ (enrollment_state_parsed | default({}, true)).get('enrollment_status', 'PENDING') | default('PENDING', true) }}"
+        bf_enr_fleet_status: "{{ (enrollment_state_parsed | default({}, true)).get('fleet_status', 'PENDING') | default('PENDING', true) }}"
+        bf_enr_central: "{{ (enrollment_state_parsed | default({}, true)).get('central_verification', {}) | default({}, true) }}"
+        bf_enr_cli_lifecycle: "{{ enrollment_status_cli.stdout | default('') | regex_findall('(?m)^Lifecycle: (.+)$') | first | default('', true) }}"
+        bf_enr_cli_enrollment: "{{ enrollment_status_cli.stdout | default('') | regex_findall('(?m)^Enrollment: (.+)$') | first | default('', true) }}"
+
+    - name: Merkez doğrulama kanallarını çıkar
+      ansible.builtin.set_fact:
+        bf_enr_central_status: "{{ bf_enr_central.get('status', '') | default('', true) }}"
+        bf_enr_central_id: "{{ bf_enr_central.get('verification_id', '') | default('', true) }}"
+        bf_enr_central_channel_states: "{{ dict(enrollment_central_channels | zip(enrollment_central_channels | map('extract', bf_enr_central, 'status') | map('default', 'pending', true) | list)) }}"
+        bf_enr_central_channel_ids: "{{ dict(enrollment_central_channels | zip(enrollment_central_channels | map('extract', bf_enr_central, 'verification_id') | map('default', '', true) | list)) }}"
+
+    - name: Merkez kanıtı tam mı hesapla
+      ansible.builtin.set_fact:
+        bf_enr_central_ok: >-
+          {{ (bf_enr_central_status == 'verified')
+             and (bf_enr_central_id | length > 0)
+             and (bf_enr_central_channel_states.values() | select('equalto', 'verified') | list | length == bf_enr_central_channel_states | length)
+             and (bf_enr_central_channel_ids.values() | select('equalto', '') | list | length == 0) }}
+        bf_enr_cli_mismatch: "{{ 'MISMATCH' if (bf_enr_cli_lifecycle | length > 0) and (bf_enr_cli_lifecycle != bf_enr_phase) else 'OK' }}"
+
+    - name: Merkez kanıtı durumunu etiketle
+      ansible.builtin.set_fact:
+        bf_enr_central_state: >-
+          {{ 'not-required' if (bf_enr_enrollment_status != 'ENROLLED' and bf_enr_phase not in enrollment_central_required_for)
+             else ('verified' if bf_enr_central_ok | bool else 'MISSING') }}
+        bf_enr_missing_central: >-
+          {{ (bf_enr_enrollment_status == 'ENROLLED' or bf_enr_phase in enrollment_central_required_for)
+             and not (bf_enr_central_ok | bool) }}
+
+    - name: Cihaz enrollment satırını raporla
+      ansible.builtin.debug:
+        msg: >-
+          {{ bf_enr_device_id }} phase={{ bf_enr_phase }} enrollment={{ bf_enr_enrollment_status }}
+          fleet={{ bf_enr_fleet_status }} merkez_kaniti={{ bf_enr_central_state }}
+          kanallar={{ bf_enr_central_channel_states }} kanit_id={{ 'SET' if bf_enr_central_id | length > 0 else 'ABSENT' }}
+
+    - name: Eksik merkez kanıtı olan cihazı işaretle
+      ansible.builtin.debug:
+        msg: "UYARI {{ bf_enr_device_id }}: enrollment/faz iddiası var ama merkez kanıtı eksik ({{ bf_enr_central_state }}); READY verilemez (docs/29)."
+      when: bf_enr_missing_central | bool
+
+    - name: Merkez kanıtı eksik kanalları ayrıntılı yaz
+      ansible.builtin.debug:
+        msg: "UYARI {{ bf_enr_device_id }}: kanal kanıtı eksik -> {{ bf_enr_incomplete_channels }}"
+      vars:
+        bf_enr_incomplete_channels: "{{ bf_enr_central_channel_states | dict2items | rejectattr('value', 'equalto', 'verified') | map(attribute='key') | list }}"
+      when: bf_enr_missing_central | bool
+
+    - name: Kalıcı faz ile kanonik CLI çıktısı çelişen cihazı işaretle
+      ansible.builtin.debug:
+        msg: "UYARI {{ bf_enr_device_id }}: state.json phase={{ bf_enr_phase }} ama bf-enrollment-status Lifecycle={{ bf_enr_cli_lifecycle }}."
+      when: bf_enr_cli_mismatch == 'MISMATCH'
+
+    - name: Enrollment durum dağılımını hesapla
+      ansible.builtin.set_fact:
+        bf_enr_status_histogram: "{{ bf_enr_status_histogram | default({}) | combine({ item: bf_enr_wave_states | select('equalto', item) | list | length }) }}"
+      loop: "{{ bf_enr_wave_states | unique | sort }}"
+      vars:
+        bf_enr_wave_states: "{{ ansible_play_hosts_all | map('extract', hostvars, 'bf_enr_enrollment_status') | map('default', 'PENDING', true) | list }}"
+      run_once: true
+
+    - name: Fleet durum dağılımını hesapla
+      ansible.builtin.set_fact:
+        bf_enr_fleet_histogram: "{{ bf_enr_fleet_histogram | default({}) | combine({ item: bf_enr_wave_fleet | select('equalto', item) | list | length }) }}"
+      loop: "{{ bf_enr_wave_fleet | unique | sort }}"
+      vars:
+        bf_enr_wave_fleet: "{{ ansible_play_hosts_all | map('extract', hostvars, 'bf_enr_fleet_status') | map('default', 'PENDING', true) | list }}"
+      run_once: true
+
+    - name: Dalga enrollment özetini yaz
+      ansible.builtin.debug:
+        msg:
+          - "Dalga {{ operation_wave }} | raporlanan cihaz: {{ ansible_play_hosts_all | length }}"
+          - "enrollment_status: {{ bf_enr_status_histogram | default({}) }}"
+          - "fleet_status: {{ bf_enr_fleet_histogram | default({}) }}"
+      run_once: true
+
+    - name: Eksik merkez kanıtı olan cihazların dalga listesini yaz
+      ansible.builtin.debug:
+        msg: "Merkez kanıtı eksik cihazlar: {{ bf_enr_missing_central_hosts }}"
+      vars:
+        bf_enr_missing_central_hosts: "{{ dict(ansible_play_hosts_all | zip(ansible_play_hosts_all | map('extract', hostvars, 'bf_enr_central_state') | map('default', 'MISSING', true) | list)) | dict2items | selectattr('value', 'equalto', 'MISSING') | map(attribute='key') | list }}"
+      run_once: true
+
+    - name: Kanonik CLI ile çelişen cihazların dalga listesini yaz
+      ansible.builtin.debug:
+        msg: "state.json ve bf-enrollment-status çelişkili cihazlar: {{ bf_enr_cli_mismatch_hosts }}"
+      vars:
+        bf_enr_cli_mismatch_hosts: "{{ dict(ansible_play_hosts_all | zip(ansible_play_hosts_all | map('extract', hostvars, 'bf_enr_cli_mismatch') | map('default', 'OK', true) | list)) | dict2items | selectattr('value', 'equalto', 'MISMATCH') | map(attribute='key') | list }}"
+      run_once: true

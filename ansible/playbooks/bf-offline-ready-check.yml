@@ -1,0 +1,272 @@
+---
+# Blueforce offline hazırlık raporu -- READ-ONLY, dalga kapsamlı.
+# Ne yapar: internet olmadan PROVISIONED_OFFLINE durumuna ulaşmayı sağlayan yerel ön koşulları
+#           kanıtlarıyla raporlar:
+#             1) offline APT repo mevcut mu (BF_OFFLINE_REPO, varsayılan /opt/blueforce/offline-repo,
+#                zorunlu Packages/Packages.gz/packages.lock.tsv/SHA256SUMS dosyaları),
+#             2) yerel paketler doğrulanmış mı (sha256sum -c SHA256SUMS, paket kilidi şeması,
+#                havuzda pinlenen .deb dosyaları),
+#             3) firstboot tamamlanma damgası var mı (/var/lib/blueforce/firstboot-complete),
+#             4) onaysız update kapısı aktif mi (20auto-upgrades değerleri 0 + apt-daily timer
+#                maskeleme + apt/dpkg kilidi meşgul değil).
+#           Sözleşme: docs/27 (offline provisioning), docs/10 (update kapısı), docs/05 modül 14.
+# Hiçbir görev durum değiştirmez: yalnız stat/slurp ve read-only CLI çıktısı okunur; tüm command
+# görevleri changed_when: false taşır.
+# Kuru koşu: ansible-playbook -i inventory/hosts.yml playbooks/bf-offline-ready-check.yml -e operation_wave=lab -e operation_confirmed=true --check
+# Koşu:      ansible-playbook -i inventory/hosts.yml playbooks/bf-offline-ready-check.yml -e operation_wave=lab -e operation_confirmed=true
+# SHA256 doğrulamasını atlamak için: -e bf_offline_verify_hashes=false
+# Semaphore Pro bağımlılığı yok.
+# Dalga kapısı: operation_wave + operation_confirmed (+ production_override) rapor play'inden ÖNCE,
+# hiçbir hosta dokunmadan doğrulanır; --limit dalga ile kesişmezse koşu reddedilir (fail-closed).
+- name: Dalga ve onay kapısı -- hiçbir hosta dokunmadan önce (mutasyon yok)
+  hosts: "{{ ansible_limit | default('localhost') }}"
+  gather_facts: false
+  become: false
+  vars:
+    approved_operation_waves: [lab, pilot_1, pilot_2, wave_1, wave_2, production]
+    production_override: false
+    operation_wave_gate: "{{ operation_wave | default('invalid-wave', true) }}"
+  tasks:
+    - name: Require an approved confirmed operation wave before any host is touched
+      ansible.builtin.assert:
+        that:
+          - operation_wave_gate in approved_operation_waves
+          - operation_confirmed | default(false) | bool
+          - operation_wave_gate in groups
+          - groups[operation_wave_gate] | length > 0
+          - (operation_wave_gate != 'production') or (production_override | default(false) | bool)
+        fail_msg: "operation_wave must name a non-empty approved inventory group (lab/pilot_1/pilot_2/wave_1/wave_2/production), operation_confirmed=true is required, and production additionally requires production_override=true."
+      run_once: true
+
+    - name: Require the --limit selection to intersect the declared wave
+      ansible.builtin.assert:
+        that:
+          - (((ansible_limit | default('') | split(',') | intersect(groups[operation_wave_gate]) | length) > 0)
+            or ((ansible_limit | default('') | split(',') | select('in', groups) | map('extract', groups) | flatten | unique | intersect(groups[operation_wave_gate]) | length) > 0))
+        fail_msg: "--limit selection '{{ ansible_limit }}' does not intersect the '{{ operation_wave_gate }}' wave; refusing a mis-scoped run."
+      when:
+        - (ansible_limit | default('') | length) > 0
+        - not (ansible_limit | default('') is search('[][*?]'))
+      run_once: true
+
+- name: Offline hazırlık ön koşullarını raporla (read-only)
+  hosts: "{{ operation_wave | default('invalid-wave', true) }}"
+  gather_facts: false
+  become: true  # Yalnız root sahipli offline repo/durum dosyalarını OKUMAK için; mutasyon yok.
+  vars:
+    approved_operation_waves: [lab, pilot_1, pilot_2, wave_1, wave_2, production]
+    production_override: false
+    bf_offline_repo: "{{ bf_offline_repo_path | default('/opt/blueforce/offline-repo') }}"
+    bf_offline_verify_hashes: true
+    offline_firstboot_marker: /var/lib/blueforce/firstboot-complete
+    offline_list_file: /var/lib/blueforce/offline.list
+    offline_installer: /usr/local/sbin/blueforce-install.sh
+    offline_dealer_id_file: /etc/blueforce/dealer-id
+    offline_apt_periodic_conf: /etc/apt/apt.conf.d/20auto-upgrades
+    offline_required_repo_files: [Packages, Packages.gz, packages.lock.tsv, SHA256SUMS]
+    offline_update_timers: [apt-daily.timer, apt-daily-upgrade.timer]
+    offline_pkg_processes: [apt-get, apt, dpkg]
+  pre_tasks:
+    - name: Require confirmed approved operation wave scope
+      ansible.builtin.assert:
+        that:
+          - operation_wave in approved_operation_waves
+          - operation_confirmed | bool
+          - operation_wave in groups
+          - groups[operation_wave] | length > 0
+          - ansible_play_hosts_all | length > 0
+          - ansible_play_hosts_all | difference(groups[operation_wave]) | length == 0
+        fail_msg: "Set operation_wave to one inventory wave and operation_confirmed=true; full-fleet scope is refused."
+      run_once: true
+
+    - name: Require separate production override
+      ansible.builtin.assert:
+        that:
+          - operation_wave != 'production' or production_override | bool
+        fail_msg: "Production operation requires production_override=true in addition to operation_confirmed=true."
+      run_once: true
+  tasks:
+    - name: Offline kanıt yollarını denetle (read-only)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ bf_offline_repo }}"
+        - "{{ offline_firstboot_marker }}"
+        - "{{ offline_list_file }}"
+        - "{{ offline_installer }}"
+        - "{{ offline_dealer_id_file }}"
+        - "{{ offline_apt_periodic_conf }}"
+      register: offline_evidence
+
+    - name: Zorunlu offline repo dosyalarını denetle (read-only)
+      ansible.builtin.stat:
+        path: "{{ bf_offline_repo }}/{{ item }}"
+      loop: "{{ offline_required_repo_files }}"
+      register: offline_repo_file_stats
+
+    - name: Kanıt durumlarını yol ile indeksle
+      ansible.builtin.set_fact:
+        offline_evidence_by_path: "{{ offline_evidence.results | items2dict(key_name='item', value_name='stat') }}"
+        bf_off_repo_files: "{{ dict(offline_repo_file_stats.results | map(attribute='item') | list | zip(offline_repo_file_stats.results | map(attribute='stat') | list)) }}"
+        bf_off_missing_files: >-
+          {{ (offline_repo_file_stats.results | selectattr('stat', 'defined') | rejectattr('stat.exists') | map(attribute='item') | list)
+             + (offline_repo_file_stats.results | selectattr('stat', 'defined') | selectattr('stat.exists') | selectattr('stat.size', 'equalto', 0) | map(attribute='item') | list) }}
+
+    - name: Paket kilidi satırlarını doğrula (awk, read-only)
+      ansible.builtin.command:
+        argv:
+          - awk
+          - 'NR==1 {hdr = ($1=="package" && $2=="version" && $3=="architecture" && $4=="sha256" && $5=="source") ? 1 : 0; next} /^[[:space:]]*#/ || NF==0 {next} {rows++; if (NF==5 && $1 ~ /^[a-z0-9][a-z0-9+.-]*$/ && $4 ~ /^[a-f0-9]{64}$/ && $2!="" && $3!="" && $5!="") {ok++}} END {printf "header=%d rows=%d valid=%d\n", hdr, rows, ok}'
+          - "{{ bf_offline_repo }}/packages.lock.tsv"
+      register: offline_lock_probe
+      changed_when: false
+      failed_when: false
+      when:
+        - bf_off_repo_files['packages.lock.tsv'].exists | default(false)
+        - bf_off_repo_files['packages.lock.tsv'].size | default(0) | int > 0
+
+    - name: Kilitli paket kaynak yollarını listele (awk, read-only)
+      ansible.builtin.command:
+        argv:
+          - awk
+          - 'NR>1 && NF>0 && $0 !~ /^[[:space:]]*#/ {print $5}'
+          - "{{ bf_offline_repo }}/packages.lock.tsv"
+      register: offline_lock_sources
+      changed_when: false
+      failed_when: false
+      when:
+        - bf_off_repo_files['packages.lock.tsv'].exists | default(false)
+        - bf_off_repo_files['packages.lock.tsv'].size | default(0) | int > 0
+
+    - name: Pinlenen paketlerin havuz dosyalarını denetle (read-only)
+      ansible.builtin.stat:
+        path: "{{ bf_offline_repo }}/pool/{{ item }}"
+      loop: "{{ offline_lock_sources.stdout_lines | default([]) }}"
+      register: offline_pool_files
+
+    - name: Yerel APT indekslerinin SHA256 doğrulamasını yap (read-only)
+      ansible.builtin.command:
+        argv:
+          - sha256sum
+          - -c
+          - --quiet
+          - SHA256SUMS
+        chdir: "{{ bf_offline_repo }}"
+      register: offline_checksums
+      changed_when: false
+      failed_when: false
+      when:
+        - bf_offline_verify_hashes | bool
+        - bf_off_repo_files['SHA256SUMS'].exists | default(false)
+        - bf_off_repo_files['SHA256SUMS'].size | default(0) | int > 0
+
+    - name: Update kapısı yapılandırmasını oku (read-only)
+      ansible.builtin.slurp:
+        src: "{{ offline_apt_periodic_conf }}"
+      register: offline_apt_periodic_raw
+      when:
+        - offline_evidence_by_path[offline_apt_periodic_conf].exists | default(false)
+        - offline_evidence_by_path[offline_apt_periodic_conf].size | default(0) | int > 0
+
+    - name: Otomatik güncelleme timer maskelemesini oku (read-only)
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-enabled
+          - "{{ item }}"
+      loop: "{{ offline_update_timers }}"
+      register: offline_timer_states
+      changed_when: false
+      failed_when: false
+
+    - name: Paket işlemi çalışıyor mu denetle (read-only)
+      ansible.builtin.command:
+        argv:
+          - pgrep
+          - -x
+          - "{{ item }}"
+      loop: "{{ offline_pkg_processes }}"
+      register: offline_pkg_procs
+      changed_when: false
+      failed_when: false
+
+    - name: Offline hazırlık ölçümlerini hesapla
+      ansible.builtin.set_fact:
+        bf_off_repo_present: "{{ offline_evidence_by_path[bf_offline_repo].exists | default(false) and offline_evidence_by_path[bf_offline_repo].isdir | default(false) }}"
+        bf_off_missing_count: "{{ bf_off_missing_files | length }}"
+        bf_off_lock_header_ok: "{{ offline_lock_probe.stdout | default('') | regex_findall('header=([0-9]+)') | first | default('0', true) == '1' }}"
+        bf_off_lock_rows: "{{ offline_lock_probe.stdout | default('') | regex_findall('rows=([0-9]+)') | first | default('0', true) | int }}"
+        bf_off_lock_valid: "{{ offline_lock_probe.stdout | default('') | regex_findall('valid=([0-9]+)') | first | default('0', true) | int }}"
+        bf_off_pool_checked: "{{ offline_pool_files.results | default([]) | selectattr('stat', 'defined') | list | length }}"
+        bf_off_pool_missing: >-
+          {{ offline_pool_files.results | default([]) | selectattr('stat', 'defined') | map(attribute='stat')
+             | selectattr('exists', 'defined') | rejectattr('exists') | list | length }}
+        bf_off_firstboot_marker: "{{ offline_evidence_by_path[offline_firstboot_marker].exists | default(false) }}"
+        bf_off_installer_present: "{{ (offline_evidence_by_path[offline_installer].exists | default(false)) and (offline_evidence_by_path[offline_installer].executable | default(false)) }}"
+        bf_off_dealer_id_present: "{{ offline_evidence_by_path[offline_dealer_id_file].exists | default(false) }}"
+        bf_off_offline_list_present: "{{ offline_evidence_by_path[offline_list_file].exists | default(false) }}"
+        bf_off_apt_periodic: "{{ dict(bf_off_apt_periodic_values | map('first') | map('lower') | list | zip(bf_off_apt_periodic_values | map('last') | list)) }}"
+        bf_off_update_timers_masked: "{{ offline_timer_states.results | default([]) | map(attribute='stdout') | map('trim') | reject('equalto', 'masked') | list | length == 0 }}"
+        bf_off_pkg_lock_busy: "{{ offline_pkg_procs.results | default([]) | selectattr('rc', 'equalto', 0) | list | length > 0 }}"
+      vars:
+        bf_off_apt_periodic_values: >-
+          {{ offline_apt_periodic_raw.content | default('', true) | b64decode
+             | regex_findall('(?m)^APT::Periodic::([A-Za-z-]+)[ =]+[^0-9]*([0-9]+)') }}
+
+    - name: Yerel paket doğrulama ve update kapısı durumunu etiketle
+      ansible.builtin.set_fact:
+        bf_off_checksum_state: >-
+          {{ 'SKIPPED' if not (bf_offline_verify_hashes | bool)
+             else ('VERIFIED' if offline_checksums.rc | default(1) == 0
+             else ('MISSING' if not (bf_off_repo_files['SHA256SUMS'].exists | default(false)) else 'FAILED')) }}
+        bf_off_update_gate: >-
+          {{ 'ACTIVE' if (bf_off_apt_periodic.get('unattended-upgrade', '1') == '0'
+                          and bf_off_apt_periodic.get('enable', '1') == '0'
+                          and bf_off_update_timers_masked | bool)
+             else 'INACTIVE' }}
+
+    - name: Offline hazırlık engellerini topla
+      ansible.builtin.set_fact:
+        bf_off_blockers: >-
+          {{ (['offline repo yok veya dizin değil: ' ~ bf_offline_repo] if not (bf_off_repo_present | bool) else [])
+             + ([('zorunlu offline dosyası eksik/boş: ' ~ (bf_off_missing_files | join(', ')))] if (bf_off_missing_count | int) > 0 else [])
+             + (['paket kilidi başlığı geçersiz (package/version/architecture/sha256/source)'] if not (bf_off_lock_header_ok | bool) else [])
+             + ([('paket kilidi geçersiz veya boş satırlar: ' ~ (bf_off_lock_valid | string) ~ '/' ~ (bf_off_lock_rows | string))] if ((bf_off_lock_rows | int) == 0 or (bf_off_lock_valid | int) != (bf_off_lock_rows | int)) else [])
+             + ([('havuzda eksik paket dosyası: ' ~ (bf_off_pool_missing | string))] if (bf_off_pool_missing | int) > 0 else [])
+             + (['yerel APT indeksi SHA256 doğrulaması BAŞARISIZ'] if bf_off_checksum_state == 'FAILED' else [])
+             + (['onaysız update kapısı kapalı (unattended-upgrades veya apt-daily timer açık)'] if bf_off_update_gate != 'ACTIVE' else [])
+             + (['başka bir paket işlemi koşuyor (apt/dpkg kilidi meşgul)'] if bf_off_pkg_lock_busy | bool else []) }}
+
+    - name: Offline hazırlık kararını yaz
+      ansible.builtin.set_fact:
+        bf_off_verdict: "{{ 'PROVISIONED_OFFLINE-READY' if (bf_off_blockers | length) == 0 else 'BLOCKED' }}"
+
+    - name: Cihaz offline hazırlık satırını raporla
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname | upper }} offline_repo={{ 'VAR' if bf_off_repo_present | bool else 'YOK' }} eksik_dosya={{ bf_off_missing_count }} paket_kilidi={{ bf_off_lock_valid }}/{{ bf_off_lock_rows }} havuz={{ bf_off_pool_checked }} eksik_havuz={{ bf_off_pool_missing }}"
+          - "{{ inventory_hostname | upper }} sha256={{ bf_off_checksum_state }} firstboot_damgasi={{ 'VAR' if bf_off_firstboot_marker | bool else 'YOK' }} update_kapisi={{ bf_off_update_gate }} paket_islemi_mesgul={{ bf_off_pkg_lock_busy }}"
+          - "{{ inventory_hostname | upper }} kurucu={{ 'VAR' if bf_off_installer_present | bool else 'YOK' }} bayi_kimligi={{ 'VAR' if bf_off_dealer_id_present | bool else 'YOK' }} offline.list={{ 'VAR' if bf_off_offline_list_present | bool else 'YOK' }} karar={{ bf_off_verdict }}"
+
+    - name: Offline ön koşulu eksik cihaz için engelleri yaz
+      ansible.builtin.debug:
+        msg: "ENGELLER {{ inventory_hostname | upper }}: {{ bf_off_blockers }}"
+      when: bf_off_blockers | length > 0
+
+    - name: Offline hazırlık karar dağılımını hesapla
+      ansible.builtin.set_fact:
+        bf_off_verdict_histogram: "{{ bf_off_verdict_histogram | default({}) | combine({ item: bf_off_wave_verdicts | select('equalto', item) | list | length }) }}"
+      loop: "{{ bf_off_wave_verdicts | unique | sort }}"
+      vars:
+        bf_off_wave_verdicts: "{{ ansible_play_hosts_all | map('extract', hostvars, 'bf_off_verdict') | map('default', 'BLOCKED', true) | list }}"
+      run_once: true
+
+    - name: Dalga offline hazırlık özetini yaz
+      ansible.builtin.debug:
+        msg:
+          - "Dalga {{ operation_wave }} | raporlanan cihaz: {{ ansible_play_hosts_all | length }}"
+          - "Karar dağılımı: {{ bf_off_verdict_histogram | default({}) }}"
+          - "Offline ön koşulu eksik cihazlar: {{ bf_off_blocked_hosts }}"
+      vars:
+        bf_off_blocked_hosts: "{{ dict(ansible_play_hosts_all | zip(ansible_play_hosts_all | map('extract', hostvars, 'bf_off_verdict') | map('default', 'BLOCKED', true) | list)) | dict2items | selectattr('value', 'equalto', 'BLOCKED') | map(attribute='key') | list }}"
+      run_once: true

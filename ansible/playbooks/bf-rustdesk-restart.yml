@@ -1,0 +1,25 @@
+---
+# Restart the RustDesk remote-access service.
+# Run: ansible-playbook -i inventory/hosts.yml playbooks/bf-rustdesk-restart.yml --limit lab
+# Service name is overridable via rustdesk_service_name.
+# No Semaphore Pro feature is used.
+- name: Restart RustDesk service
+  hosts: blueforce
+  gather_facts: false
+  become: true
+  vars:
+    rustdesk_restart_service: "{{ rustdesk_service_name | default('rustdesk') }}"
+  tasks:
+    - name: Restart RustDesk
+      ansible.builtin.systemd:
+        name: "{{ rustdesk_restart_service }}"
+        state: restarted
+
+    - name: Verify RustDesk is active
+      ansible.builtin.command: "systemctl is-active {{ rustdesk_restart_service }}"
+      register: rustdesk_state
+      changed_when: false
+
+    - name: Show RustDesk state
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} rustdesk={{ rustdesk_state.stdout }}"

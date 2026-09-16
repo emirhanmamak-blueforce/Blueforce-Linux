@@ -1,0 +1,10 @@
+# Purpose: Manually switch a field device to graphical mode for maintenance.
+# This unit is deliberately not enabled by any boot target.
+[Unit]
+Description=Blueforce GUI on (manual graphical maintenance switch)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bf-gui-on
+RemainAfterExit=no

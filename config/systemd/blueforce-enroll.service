@@ -1,0 +1,45 @@
+# Blueforce enrollment controlled attempt: PROVISIONED_OFFLINE -> ENROLLED.
+#
+# Behaviour (docs/29-DEVICE-ENROLLMENT.md, provisioning/enrollment/README.md):
+#   * One bounded attempt per start. The unit never reboots the device and never
+#     loops: a device without internet or without a staged token prints PENDING,
+#     exits 0 and stays PROVISIONED_OFFLINE.
+#   * When a one-time token has been staged (bf-enroll --token-stdin --stage,
+#     mode 0600, TTL bounded) the attempt enrolls by itself as soon as central is
+#     reachable. RestartSec plus the StartLimit below cap that at six attempts
+#     per hour and then leave the cadence to blueforce-enroll.timer, so a device
+#     that stays offline for weeks is never hammered.
+#   * No credential lives in this unit: bf-enroll reads the staged root-only
+#     token once and deletes it on success or on a definitive rejection.
+#   * Restart= is on-failure only, so a successful run, a READY device and an
+#     unprovisioned device are never retried.
+#   * Trigger: blueforce-enroll.timer (OnBootSec=10min, then daily). An operator
+#     can also run `bf-enroll-now` interactively at any time.
+[Unit]
+Description=Blueforce enrollment controlled attempt (bounded retries, never reboots)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=1h
+StartLimitBurst=6
+
+[Service]
+Type=exec
+# Central control plane endpoint and timing, delivered by central configuration.
+# Optional on purpose: the attempt reports PENDING when it is not configured yet.
+EnvironmentFile=-/etc/blueforce/enrollment.env
+ExecStart=/usr/local/bin/bf-enroll --systemd
+# Bounded retry: enough to join automatically when connectivity returns, never
+# aggressive while the device is offline (systemd holds the next attempt for
+# RestartSec instead of spinning).
+Restart=on-failure
+RestartSec=5min
+TimeoutStartSec=180
+User=root
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# Writable paths only: lifecycle state plus staged token, WireGuard configuration
+# (including the wg-quick enable symlink) and central configuration.
+ReadWritePaths=/var/lib/blueforce /etc/wireguard /etc/blueforce /etc/systemd/system

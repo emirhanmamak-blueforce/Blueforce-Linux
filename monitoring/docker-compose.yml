@@ -1,0 +1,47 @@
+# Central monitoring stack for the Blueforce fleet.
+# Grafana requires GF_SECURITY_ADMIN_PASSWORD__FILE on first startup; no default credential exists.
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: bf-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./prometheus/targets:/etc/prometheus/targets:ro
+      - prometheus-data:/prometheus
+    command: [--config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.path=/prometheus, --storage.tsdb.retention.time=90d, --web.enable-lifecycle]
+    ports: ["127.0.0.1:9090:9090"]
+    networks: [monitoring]
+  grafana:
+    image: grafana/grafana-oss:11
+    container_name: bf-grafana
+    restart: unless-stopped
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GF_SECURITY_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+    secrets: [grafana_admin_password]
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+    ports: ["127.0.0.1:3001:3000"]
+    networks: [monitoring]
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: bf-uptime-kuma
+    restart: unless-stopped
+    volumes: [uptime-kuma-data:/app/data]
+    ports: ["127.0.0.1:3002:3001"]
+    networks: [monitoring]
+secrets:
+  grafana_admin_password:
+    file: "${GRAFANA_ADMIN_PASSWORD_FILE:?Set GRAFANA_ADMIN_PASSWORD_FILE to a root-owned password file}"
+volumes:
+  prometheus-data:
+  grafana-data:
+  uptime-kuma-data:
+networks:
+  monitoring:
+    driver: bridge

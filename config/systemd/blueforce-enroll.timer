@@ -1,0 +1,11 @@
+[Unit]
+Description=Blueforce enrollment pending reminder
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=24h
+Persistent=true
+Unit=blueforce-enroll.service
+
+[Install]
+WantedBy=timers.target

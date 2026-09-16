@@ -29,7 +29,7 @@ LİSANS:   Yok (donanım ayarı).
 ```
 
 ```text
-KARAR:    Boot zinciri systemd bağımlılıklarıyla sıralanır: network → `wg-quick@wg0` → `docker.service` → MEG/uygulama birimleri → remote/monitoring ajanları.
+KARAR:    Boot zinciri systemd bağımlılıklarıyla sıralanır: network → `wg-quick@wg0` → `docker.service` → MEG/uygulama birimleri → remote/monitoring ajanları; `xrdp`/`xrdp-sesman` her zaman enable/ready kalır, yerel GNOME display-manager durumu bağımsızdır.
 GEREKÇE:  Sırasız boot race üretir (Docker WG'den önce kalkar, MEG ağ bulamaz); `After=`/`Wants=` zinciri her açılışta aynı sırayı garanti eder.
 ALTERNATİF: Bağımlılıksız "hepsi enable" — açılışta rastgele sıra, elendi.
 RİSK:     Birim adları 26.04.1'e göre değişebilir; azaltma: LAB imajında doğrulanmadan dondurulmaz (K-03 riski).

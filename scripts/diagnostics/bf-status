@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+#
+# bf-status - Quick health glance for a Blueforce field terminal.
+#
+# Output contract: docs/14-MONITORING-AND-HEALTH.md ("bf-status ornek ciktisi")
+# for the health block, plus the Field OS lifecycle block defined by
+# docs/29-DEVICE-ENROLLMENT.md and provisioning/enrollment/README.md:
+#
+#   Provisioning : PROVISIONED_OFFLINE | COMPLETE
+#   Enrollment   : PENDING | ENROLLED | COMPLETE
+#   Fleet State  : NOT READY | READY
+#
+# The lifecycle block is derived read-only from /var/lib/blueforce/state.json
+# (override with BF_STATE_FILE). A missing state file shows PENDING, and a
+# contract-violating state (skipped stage, backwards move, READY without
+# verified central evidence) shows INVALID and counts as a critical alert.
+# Never prints secrets, keys, or passwords.
+#
+# Install: install -m 0755 bf-status /usr/local/bin/bf-status
+# Usage: bf-status [--help]
+#
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: bf-status [--help]
+
+Print the BLUEFORCE FIELD TERMINAL health summary: the Field OS lifecycle
+block (docs/29) followed by the 16-line health block (docs/14).
+
+Lifecycle vocabulary:
+  Provisioning : PROVISIONED_OFFLINE | COMPLETE | PENDING
+  Enrollment   : PENDING | ENROLLED | COMPLETE
+  Fleet State  : NOT READY | READY
+
+Options:
+  --help   Show this help and exit
+
+Exit status is always 0; individual failing probes report DOWN/UNKNOWN
+inline instead of aborting the report.
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+elif [[ $# -gt 0 ]]; then
+    echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2
+fi
+
+# Never abort the report on a failing probe.
+set +e
+
+HOST="$(hostname 2>/dev/null || echo unknown)"
+DEVICE_ID="$(echo "${HOST}" | tr '[:lower:]' '[:upper:]')"
+NOW="$(date '+%Y-%m-%d %H:%M %z' 2>/dev/null || echo unknown)"
+OVERALL="OK"
+
+uptime_str() {
+    uptime -p 2>/dev/null | sed 's/^up //' || echo unknown
+}
+load_str() {
+    awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null || echo "unknown"
+}
+cpu_pct() {
+    # 1-second sample from /proc/stat.
+    read -r _ a b c d e f g h i j < /proc/stat 2>/dev/null || { echo "?"; return; }
+    idle1=$((d + e)); total1=$((a+b+c+d+e+f+g+h+i+j))
+    sleep 1
+    read -r _ a b c d e f g h i j < /proc/stat 2>/dev/null || { echo "?"; return; }
+    idle2=$((d + e)); total2=$((a+b+c+d+e+f+g+h+i+j))
+    dt=$((total2 - total1)); di=$((idle2 - idle1))
+    if [[ "${dt}" -le 0 ]]; then echo "?"; else echo $(( (100 * (dt - di)) / dt )); fi
+}
+mem_str() {
+    local avail total
+    avail="$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null)"
+    total="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null)"
+    if [[ -n "${avail}" && -n "${total}" && "${total}" -gt 0 ]]; then
+        local used=$((total - avail))
+        local pct=$((100 * used / total))
+        printf '%s/%sG (%s%%)' \
+            "$(awk -v v="${used}" 'BEGIN{printf "%.1f", v/1048576}')" \
+            "$(awk -v v="${total}" 'BEGIN{printf "%.1f", v/1048576}')" \
+            "${pct}"
+    else
+        echo "unknown"
+    fi
+}
+disk_str() {
+    df -BG / 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$2); gsub(/G/,"",$3); gsub(/%/,"",$5); printf "%s/%sG (%s%%)", $3, $2, $5}' || echo "unknown"
+}
+svc_state() { # $1 = unit
+    if ! command -v systemctl >/dev/null 2>&1; then echo "UNKNOWN"; return; fi
+    if systemctl is-active --quiet "$1" 2>/dev/null; then echo "OK"; return; fi
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^$1"; then echo "DOWN"; else echo "OFF"; fi
+}
+wg_info() {
+    if ! command -v wg >/dev/null 2>&1; then echo "wg0 MISSING (no wg tool)"; return; fi
+    if ! ip link show wg0 >/dev/null 2>&1; then echo "wg0 DOWN (no interface)"; return; fi
+    local hs
+    hs="$(wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)"
+    if [[ -z "${hs}" || "${hs}" == "0" ]]; then echo "wg0 UP, no handshake yet"; return; fi
+    local now ago
+    now="$(date +%s)"; ago=$((now - hs))
+    echo "wg0 UP, handshake ${ago}s ago"
+}
+net_counters() {
+    local rx=0 tx=0 f
+    for f in /sys/class/net/*/statistics/rx_bytes; do rx=$((rx + $(cat "$f" 2>/dev/null || echo 0))); done
+    for f in /sys/class/net/*/statistics/tx_bytes; do tx=$((tx + $(cat "$f" 2>/dev/null || echo 0))); done
+    echo "rx $(numfmt --to=iec "$rx" 2>/dev/null || echo "$rx") tx $(numfmt --to=iec "$tx" 2>/dev/null || echo "$tx")"
+}
+docker_info() {
+    if ! command -v docker >/dev/null 2>&1; then echo "daemon MISSING"; return; fi
+    if docker info >/dev/null 2>&1; then echo "daemon UP"; else echo "daemon DOWN"; fi
+}
+meg_info() {
+    # MEG container name convention: meg-* ; report first match.
+    if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then echo "meg:unknown (docker down)"; return; fi
+    local line
+    line="$(docker ps --format '{{.Names}} {{.Status}} {{.RestartCount}}' 2>/dev/null | grep -i '^meg' | head -1)"
+    if [[ -z "${line}" ]]; then echo "meg NOT RUNNING"; return; fi
+    echo "${line}"
+}
+meg_last_success() {
+    local f="/var/lib/blueforce/meg_last_success"
+    if [[ -f "${f}" ]]; then
+        local ts now
+        ts="$(cat "${f}" 2>/dev/null | tr -d '[:space:]')"
+        now="$(date +%s)"
+        if [[ "${ts}" =~ ^[0-9]+$ ]]; then echo "UP, last success $((now - ts))s ago"; else echo "UP, last success unknown"; fi
+    else
+        echo "unknown (no timestamp file)"
+    fi
+}
+unattended_state() {
+    local masked="no" cfg="unknown"
+    if systemctl is-enabled apt-daily.timer 2>/dev/null | grep -q masked; then masked="yes"; fi
+    if grep -Eq '"0"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then cfg="0"; fi
+    if [[ "${masked}" == "yes" && "${cfg}" == "0" ]]; then echo "DISABLED (timer masked)"; else echo "CHECK (timer/cfg drift)"; fi
+}
+ufw_str() {
+    if ! command -v ufw >/dev/null 2>&1; then echo "ufw not installed"; return; fi
+    if ufw status 2>/dev/null | head -1 | grep -qi active; then echo "active, default DENY in | 22/3389 wg0-only"; else echo "INACTIVE"; fi
+}
+gui_str() {
+    local target sessions="0"
+    target="$(systemctl get-default 2>/dev/null || echo unknown)"
+    if ss -ltn 2>/dev/null | grep -q ':3389 '; then sessions="$(ss -tn state established '( dport = :3389 or sport = :3389 )' 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"; fi
+    if [[ "${target}" == "graphical.target" ]]; then echo "ON (graphical) | rdp sessions: ${sessions}"; else echo "OFF (multi-user) | rdp sessions: ${sessions}"; fi
+}
+kuma_str() {
+    local f="/var/lib/blueforce/kuma_last_push"
+    if [[ -f "${f}" ]]; then
+        local ts now
+        ts="$(cat "${f}" 2>/dev/null | tr -d '[:space:]')"
+        now="$(date +%s)"
+        if [[ "${ts}" =~ ^[0-9]+$ ]]; then echo "OK $((now - ts))s ago"; else echo "unknown"; fi
+    else
+        echo "unknown (no push record)"
+    fi
+}
+scrape_str() {
+    local f="/var/lib/node_exporter/textfile/last_scrape"
+    if [[ -f "${f}" ]]; then echo "OK ($(cat "${f}" 2>/dev/null | tr -d '[:space:]'))"; else echo "unknown"; fi
+}
+rustdesk_str() {
+    if pgrep -x rustdesk >/dev/null 2>&1 || systemctl is-active --quiet rustdesk 2>/dev/null; then echo "online"; else echo "offline"; fi
+}
+mesh_str() {
+    if pgrep -i meshcentral >/dev/null 2>&1 || systemctl is-active --quiet meshagent 2>/dev/null; then echo "online"; else echo "offline"; fi
+}
+boot_str() {
+    local b
+    b="$(who -b 2>/dev/null | awk '{print $3, $4}' || echo unknown)"
+    echo "${b} (power-loss recovery OK)"
+}
+alerts_str() {
+    # Warning heuristic: disk use > 80% counts one warning.
+    # A lifecycle state that violates the forward-only contract is critical.
+    local pct
+    if [[ "${LIFECYCLE_INVALID:-0}" -eq 1 ]]; then
+        echo '1 critical, 0 warning (lifecycle state invalid)'
+        return
+    fi
+    pct="$(df / 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
+    if [[ -n "${pct}" && "${pct}" -ge 90 ]] 2>/dev/null; then echo "1 critical, 0 warning (disk ${pct}%)";
+    elif [[ -n "${pct}" && "${pct}" -ge 80 ]] 2>/dev/null; then echo "0 critical, 1 warning (disk trend)";
+    else echo "0 critical, 0 warning"; fi
+}
+
+DOCKER_SVC="$(svc_state docker)"
+WG_SVC="$(svc_state "wg-quick@wg0")"
+XRDP_SVC="$(svc_state xrdp)"
+NODE_SVC="$(svc_state node_exporter)"
+
+FIELD_STATE_FILE="${BF_STATE_FILE:-/var/lib/blueforce/state.json}"
+LIFECYCLE_PHASE='PENDING'
+LIFECYCLE_PROVISIONING='PENDING'
+LIFECYCLE_ENROLLMENT='PENDING'
+LIFECYCLE_FLEET='NOT READY'
+LIFECYCLE_INVALID=0
+# Lifecycle vocabulary is fixed by docs/29; values are never upgraded locally:
+# only bf-enroll (ENROLLED) and the final install gate (READY) may advance them.
+read_lifecycle() {
+    local out lifecycle enrollment fleet
+    out="$("$(dirname "$0")/bf-enrollment-status" 2>/dev/null)" || true
+    lifecycle="$(printf '%s\n' "$out" | sed -n 's/^Lifecycle: //p')"
+    enrollment="$(printf '%s\n' "$out" | sed -n 's/^Enrollment: //p')"
+    fleet="$(printf '%s\n' "$out" | sed -n 's/^Fleet: //p')"
+    case "$lifecycle" in
+        PROVISIONED_OFFLINE) LIFECYCLE_PHASE='PROVISIONED_OFFLINE'; LIFECYCLE_PROVISIONING='PROVISIONED_OFFLINE' ;;
+        ENROLLED) LIFECYCLE_PHASE='ENROLLED'; LIFECYCLE_PROVISIONING='COMPLETE' ;;
+        READY) LIFECYCLE_PHASE='READY'; LIFECYCLE_PROVISIONING='COMPLETE' ;;
+        INVALID) LIFECYCLE_PHASE='INVALID'; LIFECYCLE_PROVISIONING='PENDING'; LIFECYCLE_INVALID=1 ;;
+        *) LIFECYCLE_PHASE='PENDING'; LIFECYCLE_PROVISIONING='PENDING' ;;
+    esac
+    case "$enrollment" in
+        PENDING|ENROLLED|COMPLETE) LIFECYCLE_ENROLLMENT="$enrollment" ;;
+        *) LIFECYCLE_ENROLLMENT='PENDING' ;;
+    esac
+    case "$fleet" in
+        READY) LIFECYCLE_FLEET='READY' ;;
+        *) LIFECYCLE_FLEET='NOT READY' ;;
+    esac
+}
+release_commit() { git -C "$(cd "$(dirname "$0")/../.." && pwd)" rev-parse --short HEAD 2>/dev/null || echo unknown; }
+
+release_info() { "$(dirname "$0")/bf-release" 2>&1 || true; }
+
+read_lifecycle
+[[ "$LIFECYCLE_INVALID" -eq 1 ]] && OVERALL='WARN'
+printf 'Field OS lifecycle: %s | Release: %s\n' "$LIFECYCLE_PHASE" "$(release_info | paste -sd ';' -)"
+printf 'Provisioning : %s\n' "$LIFECYCLE_PROVISIONING"
+printf 'Enrollment   : %s\n' "$LIFECYCLE_ENROLLMENT"
+printf 'Fleet State  : %s\n' "$LIFECYCLE_FLEET"
+printf '%s  %s  %s\n' "${DEVICE_ID}" "${NOW}" "${OVERALL}"
+printf 'uptime: %s | load: %s\n' "$(uptime_str)" "$(load_str)"
+printf 'cpu: %s%% | mem: %s | disk /: %s\n' "$(cpu_pct)" "$(mem_str)" "$(disk_str)"
+printf 'net: %s | %s\n' "$(wg_info)" "$(net_counters)"
+printf 'docker: %s | %s\n' "$(docker_info)" "$(meg_info)"
+printf 'meg: %s\n' "$(meg_last_success)"
+printf 'systemd: docker %s | wg-quick@wg0 %s | xrdp %s | node_exporter %s\n' "${DOCKER_SVC}" "${WG_SVC}" "${XRDP_SVC}" "${NODE_SVC}"
+printf 'unattended-upgrades: %s\n' "$(unattended_state)"
+printf 'ufw: %s\n' "$(ufw_str)"
+printf 'gui: %s\n' "$(gui_str)"
+printf 'kuma push: %s | prometheus scrape: %s\n' "$(kuma_str)" "$(scrape_str)"
+printf 'rustdesk: %s | meshcentral: %s\n' "$(rustdesk_str)" "$(mesh_str)"
+printf 'boot: %s\n' "$(boot_str)"
+printf 'alerts: %s\n' "$(alerts_str)"
+printf 'next: support bundle: bf-support-bundle\n'

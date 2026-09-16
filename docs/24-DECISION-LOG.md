@@ -1,12 +1,13 @@
 # 24 — Karar Günlüğü (Decision Log)
 
-> Kısa özet: Blueforce 700 cihaz Linux filosunun tüm nihai mimari kararları tek tabloda; her karar KARAR/GEREKÇE/ALTERNATİF/RİSK/MALİYET/LİSANS bloğu + resmi kaynak URL ile. Diğer 25 dokümanın başvurduğu kilit dosyadır.
+> Kısa özet: Blueforce 700 cihaz Linux filosunun tüm nihai mimari kararları tek tabloda; her karar KARAR/GEREKÇE/ALTERNATİF/RİSK/MALİYET/LİSANS bloğu + resmi kaynak URL ile. Diğer numaralı dokümanların başvurduğu kilit dosyadır (K-01…K-24).
 >
 > - Dosya: `docs/24-DECISION-LOG.md`
 > - İlgili kararlar: bu dosyanın kendisi kilit kaynaktır; `01-ARCHITECTURE.md` bu kararları diyagramlaştırır.
 > - Durum: [x] Onaylı (Faz 2 kilidi; değişiklik bu dosyadan PR ile yapılır)
 > - Kural: tüm kararlarda FREE sürümler baz alınır; Pro/Enterprise zorunlu mimariye girmez.
-> - Doğrulama günü: 2026-09-15 (tüm URL'ler bu tarihte HTTP 200 ile çekildi; ayrıntı `research/` dosyalarında).
+> - Doğrulama günü: 2026-09-15 (tüm URL'ler bu tarihte HTTP 200 ile çekildi). İkinci doğrulama turu: 2026-09-16 (Subiquity autoinstall referansı + GNOME/XFCE/xrdp/NoCloud URL'leri yeniden HTTP 200 ile doğrulandı); ayrıntı `research/` dosyalarında.
+> - Numaralandırma kuralı: **append-only**. Mevcut K-01…K-19 silinmez/yeniden numaralanmaz (başka dokümanlar `#K-16`, `#K-17`, `#K-18`, `#K-19` başlıklarına link verir); yeni kararlar bir sonraki boş numaradan eklenir. Bu turda eklenen: K-20…K-24.
 
 ---
 
@@ -16,7 +17,7 @@
 
 ## 2. Kapsam
 
-- Kapsam içi: OS/GUI/boot, 4 erişim kanalı, WireGuard, fleet, monitoring, docs, golden image, Docker, cihaz kimliği, update dalgaları — aşağıdaki K-01…K-14 kararları.
+- Kapsam içi: OS/GUI/boot, 4 erişim kanalı (RDP her-zaman-hazır ayrımı dahil), WireGuard, fleet, monitoring, docs, golden image, Docker, cihaz kimliği, update dalgaları, Field OS ISO/medya stratejisi, offline provisioning, enrollment/durum modeli, release + Field OS sürüm kimliği ve Windows geçişi — aşağıdaki K-01…K-24 kararları.
 - Kapsam dışı: script kodları, VDS kurulum komutları, gerçek cihaz test sonuçları (Faz 3+ işi; ilgili dokümanlara havale edilir).
 
 ## 3. Kararlar
@@ -37,11 +38,13 @@ LİSANS:   Ubuntu LTS ücretsiz (açık kaynak bileşenler; ESM kapsamına bel b
 ```text
 KARAR:    Saha masaüstü ortamı GNOME'dur (Ubuntu Desktop standardı); XFCE elendi.
 GEREKÇE:  Kullanıcı kararı + Ubuntu Desktop standardı: tanıdık modern masaüstü, teknisyen akışıyla birebir uyum.
-ALTERNATİF: XFCE — hafif ve düşük kaynak tüketimine rağmen kullanıcı kararıyla elendi; yedekte tutulmaz.
+ALTERNATİF: XFCE — hafif ve düşük kaynak tüketimine rağmen kullanıcı kararıyla elendi; ancak K-23 uyarınca LAB A/B ölçümü için yedekte tutulur (ölçüm sonucu bu kararı revize edebilir; saha standardı ölçüm bitene kadar GNOME kalır).
 RİSK:     xRDP+GNOME kombinasyonu ek ayar isteyebilir (uyarı: GNOME oturumu RDP'de ek yapılandırma gerektirebilir); azaltma: 13-MEG-LINUX-ACCEPTANCE testi GNOME üzerinde koşar, `bf-gui-*` LAB'da 26.04.1 imajında doğrulanmadan dondurulmaz.
 MALİYET:  Ücretsiz.
-LİSANS:   GNOME (GPL/LGPL bileşenler), ücretsiz — https://www.gnome.org/ (doğrulanma: 2026-09-15).
+LİSANS:   GNOME (GPL/LGPL bileşenler), ücretsiz — https://www.gnome.org/ (doğrulanma: 2026-09-15; yeniden doğrulama: 2026-09-16, HTTP 200).
 ```
+
+> **Güncelleme (2026-09-16):** K-02 geçerli kalır; yalnız **K-23** ile ölçüme bağlanır. Saha standardı GNOME'dur; XFCE saha standardı değildir, LAB A/B ölçüm adayıdır. İki karar çelişmez: baseline = GNOME, revizyon kapısı = LAB verisi.
 
 ### K-03 — Boot davranışı ve GUI aç/kapa
 
@@ -53,6 +56,8 @@ RİSK:     Kesin birim adları ve GNOME oturum başlatma satırı 26.04.1'e gör
 MALİYET:  Ücretsiz.
 LİSANS:   xRDP Apache-2.0, ücretsiz — https://github.com/neutrinolabs/xrdp (v0.10.6.1, 2026-07-07; doğrulanma: 2026-09-15).
 ```
+
+> **Güncelleme (2026-09-16):** `bf-gui-on` / `bf-gui-off` yalnız **yerel fiziksel** grafik katmanı (display-manager + default target) yönetir; `xrdp`/`xrdp-sesman` her zaman enable/active kalır ve RDP bu anahtarlara bağlı değildir — ayrıntı ve kanıt: **K-22**.
 
 ### K-04 — Uzaktan erişim kanalları (4 kanal)
 
@@ -118,6 +123,118 @@ ALTERNATİF: Clonezilla bit-kopya (hızlı ama donanım-fragil → yedek yöntem
 RİSK:     İlk imaj heterojen donanımda sürücü eksiltebilir; azaltma: önce `bf-hardware-inventory.sh` taraması (18-ROLLOUT), LAB'da her profilde test.
 MALİYET:  Ücretsiz.
 LİSANS:   Ubuntu autoinstall/subiquity (ücretsiz, Ubuntu lisans seti içinde) — https://releases.ubuntu.com/26.04/ (doğrulanma: 2026-09-15). NOT: Faz 1'de resmi autoinstall sözdizimi ayrıca doğrulanmadı; kesin direktifler 04-GOLDEN-IMAGE'da LAB çıktısıyla yazılır.
+```
+
+### K-15 — Blueforce Field OS kurulum medyası
+
+```text
+KARAR:    Blueforce Field OS = Ubuntu Server 26.04.1+ LTS üzerinde GNOME katmanı; V1 kurulum medyası resmi upstream ISO + ayrı NoCloud seed USB'dir. Autoinstall ve custom Field ISO tamamlayıcıdır; custom ISO yalnız LAB build artefact'ı olarak ele alınır.
+GEREKÇE:  Upstream ISO + seed, cihaz-spesifik veriyi medyadan ayırır ve remaster boot riskini V1'den uzak tutar. Custom ISO dağıtım kolaylığı sağlayabilir ancak UEFI/Legacy/Secure Boot davranışı kanıtlanmadan standart değildir.
+ALTERNATİF: Yalnız custom remaster ISO — doğrulanmamış boot zinciri nedeniyle V1 için elendi; custom build gelecekte tamamlayıcıdır.
+RİSK:     26.04 autoinstall veya remaster davranışı değişir; azaltma: her release'te checksum + LAB matrisi.
+MALİYET:  Ücretsiz.
+LİSANS:   Ubuntu Server — https://ubuntu.com/download/server ; Subiquity — https://canonical-subiquity.readthedocs-hosted.com/en/latest/ ; NoCloud — https://cloudinit.readthedocs.io/en/latest/reference/datasources/nocloud.html (26.04 kesin davranışı LAB gerektirir).
+```
+
+### K-16 — Assisted offline provisioning durumu
+
+```text
+KARAR:    İnternetsiz assisted provisioning imzalı/sürümlü ISO, seed ve offline APT snapshot ile yapılır; başarılı yerel sonuç yalnız PROVISIONED_OFFLINE'dır.
+GEREKÇE:  Saha bağlantısı yokken kurulum tamamlanabilir, ancak merkezi kimlik/kanal doğrulaması olmadan READY iddiası güvenli değildir.
+ALTERNATİF: İnternet gelene kadar kurmamak — saha blokajı nedeniyle elendi; rastgele .deb taşıma — bağımlılık/sürüm belirsizliği nedeniyle elendi.
+RİSK:     Eski snapshot veya medya secret taşıması; azaltma: manifest/checksum, medya secret taraması, sürüm son kullanma tarihi.
+MALİYET:  Ücretsiz.
+LİSANS:   APT — https://manpages.ubuntu.com/manpages/noble/en/man8/apt.8.html ; dpkg — https://manpages.ubuntu.com/manpages/noble/en/man1/dpkg.1.html (26.04 offline akışı LAB gerektirir).
+```
+
+### K-17 — Cihaz enrollment ve READY kapısı
+
+```text
+KARAR:    PROVISIONED_OFFLINE cihaz, BF-<no>'ya bağlı kısa ömürlü tek-kullanımlık token ile ENROLLED olur; yalnız WireGuard, merkezi erişim ve monitoring kanalları doğrulanınca READY olur.
+GEREKÇE:  Token cihaz kimliğini bağlar, fakat bağlantı/health kanıtı değildir. Ayrı durumlar yanlış teslimi ve ortak bootstrap secret riskini önler.
+ALTERNATİF: Kalıcı ortak token — sızıntı blast-radius'u filo geneli olduğu için elendi; manuel kayıt — denetim zayıf olduğu için elendi.
+RİSK:     Token çalınması/yanlış kullanım; azaltma: TTL, atomik tek kullanım, cihaz bağlama, iptal ve audit kaydı.
+MALİYET:  Ücretsiz.
+LİSANS:   OpenSSH — https://www.openssh.com/ ; WireGuard — https://www.wireguard.com/ ; token API kurum içi uygulama ve LAB doğrulamasıdır.
+```
+
+### K-18 — Field OS release ve rollback yönetimi
+
+```text
+KARAR:    Field OS release'i immutable manifestli bir artefact setidir: upstream ISO referansı, seed, offline APT snapshot, installer/Ansible commit'i, uygulama sürümleri ve checksum'lar birlikte sürümlenir; rollback önceki onaylı release'e döner.
+GEREKÇE:  OS sürümü tek başına davranışı açıklamaz; release manifesti tekrarlanabilir kurulum, denetim ve gerçek rollback hedefi sağlar.
+ALTERNATİF: latest/yalnız Git branch — artefact bileşimi ve rollback hedefi belirsiz olduğu için elendi.
+RİSK:     Eksik artefact veya test edilmemiş rollback; azaltma: manifest kapısı, checksum/imza ve LAB rollback kanıtı.
+MALİYET:  Ücretsiz.
+LİSANS:   Git — https://git-scm.com/doc ; Ubuntu releases — https://releases.ubuntu.com/ ; Docker image sürümleme — https://docs.docker.com/reference/cli/docker/image/pull/.
+```
+
+### K-19 — Windows'tan Linux'e geçiş
+
+```text
+KARAR:    Her Windows saha cihazında önce envanter + hash doğrulanmış geri dönüş imajı alınır, sonra temiz Field OS kurulumu ve kabul yapılır; V1'de yerinde dönüşüm ve dual-boot yoktur.
+GEREKÇE:  Temiz kurulum drift'i azaltır; geri dönüş imajı uygulama/periferik kabulü başarısız olduğunda kanıtlı çıkış verir.
+ALTERNATİF: Yerinde dönüşüm veya dual-boot — disk/bootloader karmaşıklığı ve destek yükü nedeniyle elendi.
+RİSK:     Gizli iş/veri bağımlılığı; azaltma: iş sahibi onayı, image restore provası ve 13-MEG kabul kapısı.
+MALİYET:  Ücretsiz araçlar kullanılabilir; image depolama altyapı maliyetidir.
+LİSANS:   Ubuntu — https://ubuntu.com/download/server ; Clonezilla — https://clonezilla.org/ ; Windows lisans/uygulama durumu kurum tarafından doğrulanır.
+```
+
+> **2026-09-16 turu — yeni kararlar (K-20…K-24).** Aşağıdaki bloklar bu turda eklendi. Numaralar append-only'dir: K-16 (offline provisioning durumu), K-17 (enrollment), K-18 (release), K-19 (Windows geçişi) **silinmedi/yeniden numaralanmadı**; `docs/27`, `docs/29`, `docs/30` ve `docs/28` bu başlıklara link verir. İstenen konularla eşleşme: "medya stratejisi güncellemesi" → K-20; "durum modeli" → K-21 (K-16/K-17 ile birlikte okunur); "RDP her zaman hazır" → K-22; "GNOME vs XFCE A/B ölçümü" → K-23; "Field OS sürüm yönetimi" → K-24 (K-18 ile birlikte okunur).
+
+### K-20 — Medya stratejisi: autoinstall kurulum motoru, Blueforce Field OS ISO paketleme yöntemidir
+
+```text
+KARAR:    Autoinstall kurulum MOTORUDUR; Blueforce Field OS ISO ise PAKETLEME/DAĞITIM yöntemidir. İkisi rakip değildir, birlikte kullanılır: Field OS ISO içinde autoinstall + offline APT repo + firstboot bulunur. Güvenlik için autoinstall'da `interactive-sections: [storage]` KORUNUR — otomatik disk silme YOKTUR (operatör disk onayı verir). Teslim sırası: F2B'de assisted tek-USB Field OS ISO üretilir; upstream ISO + NoCloud seed USB geri dönüş yoludur. K-15 geçersiz kılınmaz, yedek yol olarak korunur.
+GEREKÇE:  Subiquity resmi referansı: autoinstall yapılandırması `/autoinstall.yaml` yolunda okunur ("irrespective of how it was provided") → ISO köküne konan autoinstall dosyası desteklenir. `interactive-sections` resmi olarak desteklenir ("A list of configuration keys to still show in the user interface"). `storage` bölümü resmi olarak "can be interactive: true" işaretlidir ve varsayılanı tek-disk sistemde lvm layout'tur; yani storage interactive bırakılmazsa kurulum en büyük diski kendiliğinden bölümler. Bu yüzden tek-USB deneyimi ile "otomatik disk silme yok" güvenlik şartı AYNI ANDA sağlanır: ISO autoinstall'ı başlatır, teknisyen yalnız disk adımını onaylar. Ayrıca `apt.fallback` varsayılanı `offline-install` ("revert to an offline installation") olduğu için internetsiz kurulum tasarım gereği çalışır.
+ALTERNATİF: Yalnız upstream ISO + NoCloud seed USB (tek medya deneyimi yok; prompt hedefi karşılanmaz → V1'in tek yolu olmaktan çıkar, yedek/geri dönüş yolu olarak kalır); Yalnız custom remaster ISO (UEFI/Legacy/Secure Boot boot zinciri LAB'da kanıtlanmadan sahaya çıkar → reddedildi); otomatik disk wipe'lı unattended (veri kaybı riski → yasak, F6 kapsamı).
+RİSK:     Remaster boot zinciri (UEFI/Legacy/Secure Boot) LAB'da kanıtlanmazsa saha USB'si açılmayabilir; azaltma: F2B çıkış kriteri = tek USB assisted kurulumun iki LAB cihazında kanıtı; kanıt yoksa F3 başlamaz ve upstream ISO + seed yolu sıcak tutulur.
+MALİYET:  Ücretsiz.
+LİSANS:   Subiquity autoinstall — https://canonical-subiquity.readthedocs-hosted.com/en/latest/reference/autoinstall-reference.html (interactive-sections; `/autoinstall.yaml` yolu; `apt.fallback` default `offline-install`; `storage` "can be interactive: true" — doğrulama: 2026-09-16, HTTP 200); cloud-init NoCloud — https://cloudinit.readthedocs.io/en/latest/reference/datasources/nocloud.html (doğrulama: 2026-09-16); Ubuntu Server ISO — https://ubuntu.com/download/server.
+```
+
+### K-21 — Cihaz durum modeli (tek kaynak): PROVISIONED_OFFLINE → ENROLLED → READY
+
+```text
+KARAR:    Cihaz yaşam döngüsü ÜÇ durumdur ve tek kaynağı `/var/lib/blueforce/state.json` + `bf-enrollment-status` çıktısıdır: PROVISIONED_OFFLINE (offline kurulum bitti, merkez doğrulaması yok) → ENROLLED (tek kullanımlık token tüketildi, WireGuard atomik kuruldu) → READY (merkezi monitoring/remote/management kanıtı + yerel WG/xRDP/RustDesk kontrolleri). READY TEK DURUM DEĞİLDİR: "işletim sistemi kuruldu" READY değildir, "token alındı" READY değildir. K-16 ve K-17 bu modelin parçalarıdır; K-21 ikisini tek sözleşmede sabitler.
+GEREKÇE:  Kod ve testler aynı sözleşmeyi uygular: `blueforce-install.sh --offline` başarıyla biterse state.json'a `phase=PROVISIONED_OFFLINE`, `enrollment_status=PENDING`, `fleet_status=PENDING` yazar; `bf-enrollment-status` yalnız bu üç durumu geçerli sayar (aksi halde `INVALID`/`PENDING` + exit≠0); `bf-enroll` yalnız PROVISIONED_OFFLINE/ENROLLED fazından enrollment kabul eder; `--offline` olmadan bu damga yazılmaz. `bf-check-ready` kalıcı READY değerini okumaz, güncel handshake ve merkez kanıtını bağımsız denetler; kanıt eksikse fail-closed kalır.
+ALTERNATİF: İkili model (kuruldu/kurulmadı) — "merkezce güvenildi" farkını görünmez kılar ve yanlış teslim üretir → elendi; READY'yi installer çıkış kodu yapmak — ağ/merkez kanıtı olmadan READY iddiası doğurur → reddedildi.
+RİSK:     Merkez kanıt alanları (`central_verification`) `pending` kalırsa cihaz ENROLLED'da bekler ve teslim gecikir; azaltma: enrollment yanıt sözleşmesi zorunlu alanları (29), fail-closed READY kapısı, 24/72 saat gözlem penceresi (IMPLEMENTATION-REPORT §9).
+MALİYET:  Ücretsiz.
+LİSANS:   systemd/journald (LGPL bileşenler) — https://www.freedesktop.org/software/systemd/man/latest/systemctl.html ; token API kurum içi uygulamadır (27/29).
+```
+
+### K-22 — RDP her zaman hazır; `bf-gui-on` / `bf-gui-off` yalnız yerel fiziksel GUI'yi kontrol eder
+
+```text
+KARAR:    `xrdp` ve `xrdp-sesman` multi-user seviyesinde HER ZAMAN enable ve active kalır; RDP kanalı `bf-gui-on` komutuna bağlı DEĞİLDİR. `bf-gui-on` / `bf-gui-off` yalnız YEREL FİZİKSEL grafik katmanını (display-manager: gdm3/gdm/sddm/lightdm + default target) kontrol eder. `bf-gui-off` xRDP servislerini asla durdurmaz veya disable etmez. Başka bir deyişle: GUI kapalı ≠ RDP kapalı.
+GEREKÇE:  Depodaki kod bu ayrımı uygular: `08-rdp` modülü xrdp+xrdp-sesman'ın enable VE active olmasını, default target'ın multi-user kalmasını doğrular; `bf-gui-off` yalnız display-manager'ı durdurur ve "xRDP stays enabled and active so remote recovery is available" sözleşmesini taşır; `tests/check-specs.sh` bf-gui-off içinde `systemctl stop/disable xrdp*` görürse testi bilinçli olarak düşürür ve 08-rdp check'i active xrdp ister; `16-POWER-LOSS` boot zinciri de xrdp'in her zaman ready olduğunu varsayar. Bu ayrım 700 cihazda yerel GUI kapalıyken de uzaktan kurtarma kanalını korur.
+ALTERNATİF: RDP'yi `bf-gui-on`'a bağlamak — GUI kapalı saha cihazında uzaktan grafik kurtarma kaybolur (sahaya gitme oranı artar) → reddedildi; her zaman grafik boot — kaynak israfı ve geniş hata yüzeyi (K-03) → elendi.
+RİSK:     GNOME oturumu RDP üzerinden ek yapılandırma isteyebilir; azaltma: 13-MEG kabulü GNOME üzerinde koşar; LAB'da 26.04.1 imajında xRDP+GNOME ve bf-gui-* doğrulanmadan dondurulmaz.
+MALİYET:  Ücretsiz.
+LİSANS:   xRDP Apache-2.0 (v0.10.6.1) — https://github.com/neutrinolabs/xrdp (doğrulama: 2026-09-16, HTTP 200); GNOME GPL/LGPL — https://www.gnome.org/ (doğrulama: 2026-09-16, HTTP 200).
+```
+
+### K-23 — GNOME saha standardı kalır; LAB'da GNOME vs XFCE A/B ölçümü yapılır
+
+```text
+KARAR:    Saha masaüstü ortamı GNOME'dur (K-02 yürürlükte kalır, geçersiz kılınmaz). Buna ek olarak LAB'da GNOME vs XFCE A/B ölçümü yapılacak ve karar ölçüm sonucuna bağlanacaktır. Ölçüm seti sabittir: (1) RAM tüketimi, (2) CPU tüketimi, (3) boot süresi, (4) RDP güvenilirliği, (5) RustDesk'in reboot sonrası davranışı, (6) login screen erişimi, (7) dummy display davranışı, (8) 24 saat ve 72 saat stabilite. RustDesk headless ZORUNLU şartı her iki kolda da aynen korunur. Ölçüm sonucu K-02'yi revize edebilir; veri gelmeden revizyon yapılmaz.
+GEREKÇE:  GNOME kullanıcı kararıdır; ancak saha koşulları (RDP oturumu + headless RustDesk + düşük RAM'li mini PC'ler) ölçülmeden "tek doğru masaüstü" iddiası kanıtsız kalır. A/B ölçümü kararı kanıta bağlar: baseline GNOME olarak sabit kalır, XFCE yalnız ölçüm adayıdır. Bu yazım K-02 ile çelişmez — K-02 sahada geçerli olan karardır, K-23 onu ölçüm kapısına bağlayan revizyon mekanizmasıdır.
+ALTERNATİF: XFCE'yi doğrudan saha standardı yapmak — kullanıcı kararı dışı ve kanıtsız → elendi; XFCE'yi tamamen kapatmak — PİLOT'ta kanıtsız revizyon talebi doğurur ve ölçüm şansı kaybolur → elendi.
+RİSK:     A/B ölçümü LAB zamanı ve iki masaüstü bakım yükü getirir; azaltma: ölçüm seti ve süreleri (24/72 saat) sabittir, sonuç tek tabloda tutulur ve LAB release kaydına bağlanır; XFCE kolu saha medyasına girmez.
+MALİYET:  Ücretsiz.
+LİSANS:   GNOME GPL/LGPL — https://www.gnome.org/ ; XFCE GPL — https://xfce.org/ (her ikisi de doğrulama: 2026-09-16, HTTP 200; XFCE yalnız LAB ölçüm adayıdır, saha standardı değildir).
+```
+
+### K-24 — Field OS sürüm kimliği: `/etc/blueforce-release` + `bf-release`
+
+```text
+KARAR:    Cihazın Field OS sürüm kimliği tek komutla okunur: `bf-release` (kaynak sırası: `BF_RELEASE_MANIFEST` → `/etc/blueforce/release-manifest.yaml` → legacy `/etc/blueforce-release` → repo içi `provisioning/release/manifest.yaml`). Manifest `status: skeleton` ise komut sürümü **UNAPPROVED_SKELETON** olarak raporlar ve sıfırdan farklı döner; skeleton release DAĞITILABİLİR release sayılmaz. Sürüm kimliği, K-18'deki immutable release manifestiyle (ISO referansı, seed, offline APT snapshot, installer/Ansible commit'i, checksum'lar) eşleşmek zorundadır. `/etc/blueforce-release` nonsecret bir cihaz-üstü kimlik dosyasıdır: token, private key veya parola içermez.
+GEREKÇE:  Sahada "hangi Field OS sürümü çalışıyor?" sorusu secret sızdırmadan, tek komutla ve denetlenebilir biçimde yanıtlanmalıdır. Depodaki davranış bunu uygular: `17-healthcheck` kurulumda `provisioning/release/manifest.yaml` dosyasını `/etc/blueforce/release-manifest.yaml` olarak kurar; `bf-release` YAML ve legacy KEY=VALUE biçimini okuyabilir, okunamayan/`skeleton` manifestte exit≠0 verir ve `tests/check-specs.sh` bu ret davranışını (`UNAPPROVED_SKELETON`) zorunlu tutar. Böylece sahte/iskelet sürüm kimliği cihazda "release var" izlenimi üretemez.
+ALTERNATİF: Yalnız `git tag` — sahada checkout yoktur, cihaz kendi sürümünü okuyamaz → elendi; yalnız `lsb_release`/`os-release` — yalnız Ubuntu tabanını gösterir, Field OS katmanını ve release bileşimini göstermez → elendi.
+RİSK:     AÇIK KONU: `/etc/blueforce-release` bugün yalnız OKUMA yoludur (legacy biçim için uyumluluk var) ve onu yazan bir release pipeline adımı depoda yok; bu dosya yazılmazsa cihaz kimliği `/etc/blueforce/release-manifest.yaml`'a (kurulum anındaki iskelet manifest) düşer ve `bf-release` UNAPPROVED_SKELETON döner. Azaltma: gerçek release üretildiğinde manifestin status'u `released` olacak ve yazma adımı 30-FIELD-OS-RELEASE-MANAGEMENT sahibi tarafından eklenmelidir.
+MALİYET:  Ücretsiz.
+LİSANS:   Git — https://git-scm.com/doc ; Ubuntu releases — https://releases.ubuntu.com/ ; Docker image sürümleme — https://docs.docker.com/reference/cli/docker/image/pull/ .
 ```
 
 ### K-10 — Docker restart politikası ve imaj disiplini
@@ -186,7 +303,7 @@ Tüm kararlarda aynı üç filtre uygulandı: (1) %100 ücretsiz/self-hosted —
 | Alternatif | Artı | Eksi | Sonuç |
 |---|---|---|---|
 | Ubuntu 24.04 LTS | Olgun donanım desteği | 26.04 doğrulandı, daha kısa destek penceresi | Yedek |
-| XFCE | Hafif, düşük kaynak | Kullanıcı kararıyla elendi (saha standardı GNOME) | Elendi |
+| XFCE | Hafif, düşük kaynak | Kullanıcı kararıyla saha standardı olmadı (GNOME baseline) | LAB A/B ölçüm adayı (K-23) |
 | AnyDesk | Tanınmış, kolay | Ticari lisans zorunlu (700 cihaz), kapalı kaynak | Elendi |
 | Tailscale/ZeroTier | Kolay mesh | Freemium, merkezi kimlik | Elendi |
 | AWX | Güçlü UI | K8s zorunlu, release'ler duraklatıldı | Elendi |
@@ -203,15 +320,18 @@ Tüm kararlarda aynı üç filtre uygulandı: (1) %100 ücretsiz/self-hosted —
 
 ## 6. Avantajlar
 
-- 14 kararın tamamı ücretsiz katmanda kanıtlı; zorunlu mimaride lisans bedeli yok.
+- 24 kararın tamamı ücretsiz katmanda kanıtlı; zorunlu mimaride lisans bedeli yok.
 - Her kararın resmi kaynak URL'si + sürümü + doğrulama tarihi var; varsayıma dayalı karar yok (belirsizler LAB/PİLOT'a havale edildi).
 - 4 erişim kanalından ikisi WireGuard-bağımsız; tek tünel arızası filoyu kör etmez.
+- Tek-USB Field OS medyası (K-20) ile tek-medya deneyimi sağlanırken otomatik disk silme yasağı (interactive storage) korunur.
 
 ## 7. Dezavantajlar
 
 - K-09 (golden image) Faz 1'de tam resmi-doğrulamalı değil; autoinstall sözdizimi LAB çıktısına bağımlı.
 - Semaphore Community'de OIDC/2FA/Vault yokluğu operasyonel disiplinle (VPN-arkası + Key Store) kapatılıyor; bu disiplin bozulursa güvenlik açığı doğar.
 - Prometheus 700 node işletme bilgisi ister; retention/kardinalite LAB'da ölçülmeden donanım siparişi verilmemeli.
+- K-20 ile tek-USB Field OS ISO hedeflenir, fakat remaster boot zinciri LAB'da kanıtlanana kadar saha medyası upstream ISO + seed olarak kalır (ikili medya geçiş dönemi).
+- K-24 açık konusu: `/etc/blueforce-release` dosyasını yazan release pipeline adımı henüz yok; cihaz sürüm kimliği iskelet manifest'e düşerse `bf-release` UNAPPROVED_SKELETON döner.
 
 ## 8. Riskler
 
@@ -223,6 +343,9 @@ Tüm kararlarda aynı üç filtre uygulandı: (1) %100 ücretsiz/self-hosted —
 | 26.04.x sürücü farkı heterojen donanımda | Orta | Orta | LAB'da profil başına imaj testi (K-01/K-09) |
 | Tek VDS iki bağımsız kanalı da barındırırsa ortak arıza | Düşük | Yüksek | hbbs/hbbr + MeshCentral ayrı VDS veya yedek planı (K-04) |
 | 700 node Prometheus kardinalite patlaması | Orta | Orta | 60 sn scrape, 30–90 gün retention, `BF-<no>` etiket şeması (K-07) |
+| Remaster Field OS ISO boot etmez (UEFI/Legacy/Secure Boot) | Orta | Yüksek | F2B çıkış kapısı: 2 LAB cihazında assisted kurulum kanıtı; aksi halde F3 başlamaz, upstream ISO + seed yolu sıcak (K-20) |
+| Skeleton manifest ile "release var" izlenimi | Düşük | Orta | `bf-release` skeleton manifestte exit≠0 (UNAPPROVED_SKELETON); check-specs bu davranışı zorunlu tutar (K-24) |
+| GNOME/XFCE kararı kanıtsız revize edilir | Düşük | Orta | A/B ölçüm seti sabit; revizyon yalnız LAB verisiyle ve PR ile (K-23) |
 
 ## 9. Uygulama Planı
 
@@ -248,6 +371,10 @@ hostnamectl set-hostname bf-12010193
 | `docker inspect` restart politikası | `unless-stopped` tüm saha konteynerlerinde | LAB(2) |
 | Semaphore kapalı iken Ansible CLI run | Playbook başarıyla koşar | LAB(2) |
 | Scrape + 17 metrik + Uptime Push | Grafana + Kuma panoları dolu | P1(5) |
+| `bf-gui-off` sonrası RDP oturumu | xRDP active kalır, GNOME oturumu açılır (K-22) | LAB(2) |
+| `bf-release` çıktısı (skeleton manifest) | `UNAPPROVED_SKELETON` + exit≠0; sahte sürüm gösterilmez (K-24) | LAB(2) |
+| Tek-USB Field OS ISO assisted kurulum | Autoinstall başlar, storage adımı operatör onayı bekler, disk kendiliğinden silinmez (K-20) | LAB(2) UEFI+Legacy |
+| GNOME vs XFCE A/B ölçümü | 8 metrik tablosu dolar; karar LAB verisiyle verilir (K-23) | LAB(2) |
 
 ## 11. Rollback
 
@@ -257,10 +384,12 @@ hostnamectl set-hostname bf-12010193
 
 ## 12. Kontrol Listesi
 
-- [ ] 14 kararın her birinde KARAR/GEREKÇE/ALTERNATİF/RİSK/MALİYET/LİSANS + kaynak URL var.
+- [ ] 24 kararın her birinde KARAR/GEREKÇE/ALTERNATİF/RİSK/MALİYET/LİSANS + kaynak URL var.
 - [ ] Ücretli hiçbir araç zorunlu mimaride değil; AnyDesk hükmü resmi URL'li.
 - [ ] `unattended-upgrades`, `latest`, Watchtower yasakları üç dosyada da tutarlı (03/10/12).
 - [ ] Ek B'deki 27 sorunun her biri ≥1 karara bağlı (boş hücre yok).
+- [ ] Ek B'ye eklenen S-28…S-37 (Field OS soruları) da ≥1 karara bağlı.
+- [ ] RDP/durum modeli/medya/GNOME ölçümü/sürüm kimliği konularında ikinci tur kararları (K-20…K-24) ile K-02/K-03/K-15/K-16/K-17/K-18 arasında çelişki yok.
 
 ## 13. Açık Sorular
 
@@ -270,6 +399,10 @@ hostnamectl set-hostname bf-12010193
 - [ ] Digest pinleme (`@sha256`) kararı — PİLOT-2 değerlendirmesi (sahibi: 12-DOCKER yazarı).
 - [ ] Prometheus retention/kardinalite hesabı (700 × 60 sn) — LAB ölçümü (sahibi: 14-MONITORING yazarı).
 - [ ] Semaphore Global Runner sayısı + eşzamanlılık — 700 node yük testi (sahibi: 09-FLEET yazarı).
+- [ ] GNOME vs XFCE A/B ölçüm seti ve sonuç tablosu (8 metrik, 24/72 saat) — LAB 2 cihaz (sahibi: platform ekibi + 03 yazarı) [K-23].
+- [ ] F2B tek-USB Field OS ISO: iso builder'ın gerçek üretime geçirilmesi + UEFI/Legacy/Secure Boot LAB matrisi — LAB (sahibi: provisioning/release yöneticisi) [K-20].
+- [ ] Offline APT repo somut paket pinleri (base-packages/remote-access/docker manifestleri) — LAB (sahibi: release yöneticisi) [K-20/K-16].
+- [ ] `/etc/blueforce-release` yazma adımının release pipeline'a eklenmesi — 30 release yönetimi (sahibi: release yöneticisi) [K-24].
 
 ---
 
@@ -309,7 +442,7 @@ hostnamectl set-hostname bf-12010193
 
 ## Ek B: 27 Soru → Karar İzlenebilirliği
 
-> NOT: `SUMMARY.md` Faz 4'te üretilecek; aşağıdaki S-01…S-27 listesi şartname + plandaki 27 kritik sorunun Faz 2 karşılığıdır. SUMMARY yazıldığında her cevap buradaki karara linklenecek.
+> NOT: `SUMMARY.md` artık üretilmiştir (2026-09-15/16); aşağıdaki S-01…S-27 listesi şartname + plandaki 27 kritik sorunun Faz 2 karşılığıdır ve SUMMARY'deki aynı sorular bu kararlara linklenir. 2026-09-16 turunda SUMMARY'ye eklenen 10 Field OS sorusu S-28…S-37 olarak listelenmiştir.
 
 | # | Soru | Karar | Doküman |
 |---|---|---|---|
@@ -341,18 +474,35 @@ hostnamectl set-hostname bf-12010193
 | S-26 | Cihaz kimliği standardı ne? | K-12 (`BF-<no>` / `bf-<no>`) | 02 |
 | S-27 | Doküman platformu hangisi? | K-08 (Docusaurus) | 22 |
 
+### Ek B-2: 10 Field OS sorusu → karar (2026-09-16 turu)
+
+| # | Soru | Karar | Doküman |
+|---|---|---|---|
+| S-28 | Blueforce Field OS nedir? | K-01 + K-02 + K-20 (Ubuntu LTS üzerinde GNOME katmanlı, tek-USB paketlenebilen saha OS standardı) | 00, 01, 26, 31 |
+| S-29 | ISO nasıl build edilir? | K-20 (autoinstall motoru + Field OS ISO paketleme; `provisioning/iso/build-blueforce-iso.sh` — bugün iskelet, gerçek build açık) | 26, 31 |
+| S-30 | Offline kurulum nasıl çalışır? | K-16 + K-20 (`apt.fallback=offline-install` + offline APT snapshot + `--offline`) | 27, 31 |
+| S-31 | Device state'leri nedir? | K-21 (PROVISIONED_OFFLINE → ENROLLED → READY) | 27, 29 |
+| S-32 | Internet olmadan ne olur? | K-16 + K-21 (yerel kurulum tamam, durum PROVISIONED_OFFLINE; READY iddiası yok) | 27 |
+| S-33 | Internet gelince ne olur? | K-17 + K-21 (tek kullanımlık token → ENROLLED; WG/erişim/monitoring doğrulaması → READY) | 29 |
+| S-34 | Enrollment nasıl olur? | K-17 (`BF-<no>` bağlı, TTL'li, tek kullanımlık token; `bf-enroll --token-stdin`) | 29 |
+| S-35 | Windows'tan geçmeden önce ne yedeklenir? | K-19 (envanter + hash doğrulamalı geri dönüş imajı + veri dışa aktarma) | 28 |
+| S-36 | Rollback nasıl olur? | K-18 + K-20 + K-22 (önceki onaylı release manifesti; gerekirse upstream ISO + onaylı seed ile yeniden kurulum) | 30, 26 |
+| S-37 | Field OS version nasıl takip edilir? | K-24 (`/etc/blueforce-release` + `bf-release`; skeleton manifest reddedilir) | 30 |
+
 ---
 
 ## Ek: Karar Haritası (hangi soru hangi karara?)
 
 ```mermaid
 flowchart LR
-    SORU["27 soru (Ek B)<br/>S-01…S-27"] --> ZEMIN["Zemin: K-01/K-02/K-03<br/>K-09/K-10/K-11/K-12"]
+    SORU["37 soru<br/>S-01…S-27 + S-28…S-37"] --> ZEMIN["Zemin: K-01/K-02/K-03<br/>K-09/K-10/K-11/K-12"]
     SORU --> AG["Ağ + erişim: K-04/K-05/K-13"]
     SORU --> OPS["Operasyon: K-06/K-07/K-14"]
     SORU --> DOC["Docs: K-08"]
+    SORU --> FIELD["Field OS: K-15/K-16/K-17/K-18/K-19<br/>K-20/K-21/K-22/K-23/K-24"]
     ZEMIN --> D1["03/04/05/10/12/02"]
     AG --> D2["07/08/06/11"]
     OPS --> D3["09/14/15"]
     DOC --> D4["22"]
+    FIELD --> D5["26/27/28/29/30/31<br/>+ 24 bu dosya"]
 ```

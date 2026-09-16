@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+#
+# bf-diagnostics - Deep health check for a Blueforce field terminal.
+#
+# Detailed version of bf-status: SMART, journal errors, docker ps,
+# WireGuard state, unattended-upgrades lock, sockets, inodes, textfiles.
+# Never prints secrets, keys, or passwords (handshake keys are redacted).
+#
+# Install: install -m 0755 bf-diagnostics /usr/local/bin/bf-diagnostics
+# Usage: bf-diagnostics [--help]
+#
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: bf-diagnostics [--help]
+
+Run deep checks: SMART, journal errors, docker ps, wg show,
+unattended-upgrades lock state, sockets, inodes, textfile collectors.
+
+Options:
+  --help   Show this help and exit
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+elif [[ $# -gt 0 ]]; then
+    echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2
+fi
+
+set +e  # report, don't abort
+
+sec() { printf '\n### %s\n' "$*"; }
+
+sec "HOST"
+hostname; uptime; systemctl get-default 2>/dev/null || echo "target: unknown"
+
+sec "SMART"
+if command -v smartctl >/dev/null 2>&1; then
+    for dev in /dev/sd? /dev/nvme?n1; do
+        [[ -b "${dev}" ]] || continue
+        echo "--- ${dev} ---"
+        smartctl -H -A "${dev}" 2>/dev/null | grep -Ei 'health|reallocated|pending|uncorrect|wear|temperature|power_on' || echo "no SMART attributes parsed"
+    done
+else
+    echo "smartctl not installed; skipping SMART."
+fi
+
+sec "JOURNAL ERRORS (last 24h, top 20)"
+if command -v journalctl >/dev/null 2>&1; then
+    journalctl --since "24 hours ago" -p err --no-pager -o short 2>/dev/null | tail -20 || echo "no journal access"
+else
+    echo "journalctl not available."
+fi
+
+sec "FAILED SYSTEMD UNITS"
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --failed --no-pager 2>/dev/null || echo "no failed units"
+else
+    echo "systemctl not available."
+fi
+
+sec "DOCKER PS"
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' 2>/dev/null || echo "docker ps failed"
+    echo "--- restart counts ---"
+    docker ps --format '{{.Names}} restarts={{.RestartCount}}' 2>/dev/null || true
+else
+    echo "docker daemon not reachable."
+fi
+
+sec "WIREGUARD (keys redacted)"
+if command -v wg >/dev/null 2>&1; then
+    wg show 2>/dev/null | sed -E 's/(private-key|public-key|preshared-key): .*/\1: <redacted>/' || echo "no WireGuard interfaces"
+    echo "--- latest handshakes ---"
+    wg show all latest-handshakes 2>/dev/null || echo "no handshake data"
+else
+    echo "wg tool not installed."
+fi
+
+sec "UNATTENDED-UPGRADES LOCK (must be DISABLED)"
+grep -H . /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null || echo "20auto-upgrades file missing"
+for t in apt-daily.timer apt-daily-upgrade.timer; do
+    printf '%s: %s\n' "$t" "$(systemctl is-enabled "$t" 2>/dev/null || echo unknown)"
+done
+
+sec "SOCKETS (listening)"
+ss -ltnp 2>/dev/null || ss -ltn 2>/dev/null || echo "ss not available"
+
+sec "DISK + INODES"
+df -h / /var 2>/dev/null
+df -i / /var 2>/dev/null | head -5
+
+sec "TEXTFILE COLLECTORS"
+ls -l /var/lib/node_exporter/textfile/ 2>/dev/null || echo "textfile dir missing"
+for f in /var/lib/node_exporter/textfile/*.prom; do
+    [[ -f "$f" ]] || continue
+    echo "--- $f ---"; head -10 "$f"
+done
+
+sec "SECURITY UPDATES PENDING"
+if command -v apt >/dev/null 2>&1; then
+    apt list --upgradable 2>/dev/null | grep -ci security || echo "0 security updates (or apt list unavailable)"
+else
+    echo "apt not available."
+fi
+
+sec "REBOOT REQUIRED"
+if [[ -f /var/run/reboot-required ]]; then echo "YES"; cat /var/run/reboot-required.pkgs 2>/dev/null || true
+else echo "NO"; fi
+
+echo
+echo "Diagnostics complete. For remote triage run: bf-support-bundle"
+exit 0

@@ -1,0 +1,9 @@
+schema_version: 1
+release:
+  name: blueforce-provisioning-skeleton
+  version: 0.1.0
+  status: skeleton
+artifacts: []
+notes:
+  - No final ISO is produced by this repository without explicit local input and LAB approval.
+  - Device identity and secrets must not be included in release artifacts.

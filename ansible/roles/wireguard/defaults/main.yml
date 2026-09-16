@@ -1,0 +1,10 @@
+---
+# Defaults for the wireguard role. Secrets MUST be overridden via Key Store / vault.
+wg_interface: wg0
+wg_address: ""
+wg_dns: ""
+wg_private_key: ""
+wg_hub_public_key: ""
+wg_hub_endpoint: ""
+wg_allowed_ips: "10.42.0.0/16"
+wg_keepalive: 25

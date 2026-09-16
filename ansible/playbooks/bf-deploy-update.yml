@@ -1,0 +1,86 @@
+---
+# Approved package update with mandatory wave scope and per-batch health gates.
+# Example: ansible-playbook -i inventory/hosts.yml playbooks/bf-deploy-update.yml -e release_wave=lab -e wave_gate_confirmed=true -e update_packages='["package=version"]'
+- name: Deploy approved package update
+  hosts: "{{ release_wave | default('invalid-wave', true) }}"
+  gather_facts: false
+  become: true
+  serial: 5
+  max_fail_percentage: 0
+  any_errors_fatal: true
+  vars:
+    release_wave: ""
+    wave_gate_confirmed: false
+    production_override: false
+    halt_on_fail: true
+    update_packages: []
+    update_cache_time: 3600
+    approved_waves: [lab, pilot_1, pilot_2, wave_1, wave_2, production]
+  pre_tasks:
+    - name: Require a valid rollout wave
+      ansible.builtin.assert:
+        that:
+          - release_wave in approved_waves
+          - release_wave in groups
+          - groups[release_wave] | length > 0
+        fail_msg: "release_wave must name a non-empty approved inventory group; refusing an ungated rollout."
+      run_once: true
+
+    - name: Require exact or subset host selection for release wave
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts_all | length > 0
+          - ansible_play_hosts_all | difference(groups[release_wave]) | length == 0
+        fail_msg: "Selected hosts must equal or be a subset of groups[release_wave]; broader fleet scope is refused."
+      run_once: true
+
+    - name: Require central wave-gate confirmation
+      ansible.builtin.assert:
+        that:
+          - wave_gate_confirmed | bool
+        fail_msg: "Set wave_gate_confirmed=true only after the prior wave health gate and central approval pass."
+      run_once: true
+
+    - name: Require separate production override
+      ansible.builtin.assert:
+        that:
+          - release_wave != 'production' or production_override | bool
+        fail_msg: "Production rollout requires production_override=true in addition to wave_gate_confirmed=true."
+      run_once: true
+
+    - name: Require halt-on-failure protection
+      ansible.builtin.assert:
+        that:
+          - halt_on_fail | bool
+        fail_msg: "halt_on_fail must remain true for every rollout."
+      run_once: true
+
+    - name: Require pinned package versions
+      ansible.builtin.assert:
+        that:
+          - update_packages | length > 0
+          - update_packages | select('match', '^[A-Za-z0-9][A-Za-z0-9+_.:-]*=.+$') | list | length == update_packages | length
+        fail_msg: "update_packages must be a non-empty list of exact package=version pins."
+      run_once: true
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: "{{ update_cache_time }}"
+
+    - name: Install approved pinned package versions
+      ansible.builtin.apt:
+        name: "{{ update_packages }}"
+        state: present
+        allow_downgrade: true
+  post_tasks:
+    - name: Run mandatory post-batch health gate
+      ansible.builtin.command: /usr/local/bin/bf-status
+      register: update_health
+      changed_when: false
+      failed_when: update_health.rc != 0
+
+    - name: Report passed post-batch health gate
+      ansible.builtin.debug:
+        msg: "Update batch health gate passed for {{ ansible_play_batch }}"
+      run_once: true

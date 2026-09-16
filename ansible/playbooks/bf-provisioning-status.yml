@@ -1,0 +1,183 @@
+---
+# Blueforce provisioning faz raporu -- READ-ONLY, dalga kapsamlı.
+# Ne yapar: /var/lib/blueforce/state.json kanıtından cihazların provisioning fazını çıkarır
+#           (PROVISIONED_OFFLINE / ENROLLED / READY / PENDING / INVALID), faz dağılımını ve
+#           faz ile yerel kanıtlar arasındaki çelişkileri (offline cihazda wg0.conf, damgasız
+#           firstboot) toplu raporlar. Durum makinesi sözleşmesi: docs/27 ve docs/29.
+# Hiçbir görev durum değiştirmez: yalnız stat/slurp ve read-only CLI çıktısı okunur; tüm
+# command görevleri changed_when: false taşır.
+# Kuru koşu: ansible-playbook -i inventory/hosts.yml playbooks/bf-provisioning-status.yml -e operation_wave=lab -e operation_confirmed=true --check
+# Koşu:      ansible-playbook -i inventory/hosts.yml playbooks/bf-provisioning-status.yml -e operation_wave=lab -e operation_confirmed=true
+# Semaphore Pro bağımlılığı yok.
+# Dalga kapısı: operation_wave + operation_confirmed (+ production_override) rapor play'inden ÖNCE,
+# hiçbir hosta dokunmadan doğrulanır; --limit dalga ile kesişmezse koşu reddedilir (fail-closed).
+- name: Dalga ve onay kapısı -- hiçbir hosta dokunmadan önce (mutasyon yok)
+  hosts: "{{ ansible_limit | default('localhost') }}"
+  gather_facts: false
+  become: false
+  vars:
+    approved_operation_waves: [lab, pilot_1, pilot_2, wave_1, wave_2, production]
+    production_override: false
+    operation_wave_gate: "{{ operation_wave | default('invalid-wave', true) }}"
+  tasks:
+    - name: Require an approved confirmed operation wave before any host is touched
+      ansible.builtin.assert:
+        that:
+          - operation_wave_gate in approved_operation_waves
+          - operation_confirmed | default(false) | bool
+          - operation_wave_gate in groups
+          - groups[operation_wave_gate] | length > 0
+          - (operation_wave_gate != 'production') or (production_override | default(false) | bool)
+        fail_msg: "operation_wave must name a non-empty approved inventory group (lab/pilot_1/pilot_2/wave_1/wave_2/production), operation_confirmed=true is required, and production additionally requires production_override=true."
+      run_once: true
+
+    - name: Require the --limit selection to intersect the declared wave
+      ansible.builtin.assert:
+        that:
+          - (((ansible_limit | default('') | split(',') | intersect(groups[operation_wave_gate]) | length) > 0)
+            or ((ansible_limit | default('') | split(',') | select('in', groups) | map('extract', groups) | flatten | unique | intersect(groups[operation_wave_gate]) | length) > 0))
+        fail_msg: "--limit selection '{{ ansible_limit }}' does not intersect the '{{ operation_wave_gate }}' wave; refusing a mis-scoped run."
+      when:
+        - (ansible_limit | default('') | length) > 0
+        - not (ansible_limit | default('') is search('[][*?]'))
+      run_once: true
+
+- name: Provisioning faz dağılımını raporla (read-only)
+  hosts: "{{ operation_wave | default('invalid-wave', true) }}"
+  gather_facts: false
+  become: true  # Yalnız root sahipli kanıt dosyalarını (state.json 0600) OKUMAK için; mutasyon yok.
+  vars:
+    approved_operation_waves: [lab, pilot_1, pilot_2, wave_1, wave_2, production]
+    production_override: false
+    provisioning_state_file: /var/lib/blueforce/state.json
+    provisioning_firstboot_marker: /var/lib/blueforce/firstboot-complete
+    provisioning_wg_conf: /etc/wireguard/wg0.conf
+    provisioning_canonical_phases: [PROVISIONED_OFFLINE, ENROLLED, READY]
+  pre_tasks:
+    - name: Require confirmed approved operation wave scope
+      ansible.builtin.assert:
+        that:
+          - operation_wave in approved_operation_waves
+          - operation_confirmed | bool
+          - operation_wave in groups
+          - groups[operation_wave] | length > 0
+          - ansible_play_hosts_all | length > 0
+          - ansible_play_hosts_all | difference(groups[operation_wave]) | length == 0
+        fail_msg: "Set operation_wave to one inventory wave and operation_confirmed=true; full-fleet scope is refused."
+      run_once: true
+
+    - name: Require separate production override
+      ansible.builtin.assert:
+        that:
+          - operation_wave != 'production' or production_override | bool
+        fail_msg: "Production operation requires production_override=true in addition to operation_confirmed=true."
+      run_once: true
+  tasks:
+    - name: Provisioning kanıt yollarını denetle (read-only)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ provisioning_state_file }}"
+        - "{{ provisioning_firstboot_marker }}"
+        - "{{ provisioning_wg_conf }}"
+      register: provisioning_evidence
+
+    - name: Kanıt durumlarını yol ile indeksle
+      ansible.builtin.set_fact:
+        provisioning_evidence_by_path: "{{ provisioning_evidence.results | items2dict(key_name='item', value_name='stat') }}"
+
+    - name: Durum dosyasını oku (read-only)
+      ansible.builtin.slurp:
+        src: "{{ provisioning_state_file }}"
+      register: provisioning_state_raw
+      when:
+        - provisioning_evidence_by_path[provisioning_state_file].exists | default(false)
+        - provisioning_evidence_by_path[provisioning_state_file].size | default(0) | int > 0
+
+    - name: Durum dosyası içeriğini çöz (bozuk dosyada rapor INVALID kalır, koşu durmaz)
+      ansible.builtin.set_fact:
+        provisioning_state_parsed: "{{ provisioning_state_raw.content | b64decode | from_json }}"
+      when: provisioning_state_raw.content is defined
+      ignore_errors: true
+
+    - name: Provisioning fazını ve yerel kanıt durumunu belirle
+      ansible.builtin.set_fact:
+        bf_state_present: "{{ provisioning_state_raw.content is defined }}"
+        bf_state_parsed: "{{ provisioning_state_parsed | default({}, true) if provisioning_state_parsed is defined else {} }}"
+        bf_firstboot_marker_exists: "{{ provisioning_evidence_by_path[provisioning_firstboot_marker].exists | default(false) }}"
+        bf_offline_wg_conf_exists: "{{ provisioning_evidence_by_path[provisioning_wg_conf].exists | default(false) }}"
+        bf_provisioning_id_present: "{{ (provisioning_state_parsed | default({}, true)).get('provisioning_id', '') | length > 0 }}"
+        bf_device_id: "{{ (provisioning_state_parsed | default({}, true)).get('device_id', inventory_hostname | upper) }}"
+
+    - name: Provisioning fazını sınıflandır
+      ansible.builtin.set_fact:
+        bf_phase_raw: "{{ (provisioning_state_parsed | default({}, true)).get('phase', '') | default('', true) }}"
+        bf_enrollment_status: "{{ (provisioning_state_parsed | default({}, true)).get('enrollment_status', 'PENDING') | default('PENDING', true) }}"
+        bf_fleet_status: "{{ (provisioning_state_parsed | default({}, true)).get('fleet_status', 'PENDING') | default('PENDING', true) }}"
+
+    - name: Faz etiketini ve durum dosyası sağlığını belirle
+      ansible.builtin.set_fact:
+        bf_phase: >-
+          {{ 'PENDING' if not bf_state_present
+             else (bf_phase_raw if bf_phase_raw in provisioning_canonical_phases else 'INVALID') }}
+        bf_state_status: >-
+          {{ 'MISSING' if not bf_state_present
+             else ('OK' if bf_phase_raw in provisioning_canonical_phases else 'INVALID') }}
+
+    - name: Yerel kanıt çelişkilerini belirle
+      ansible.builtin.set_fact:
+        bf_offline_wg_conflict: "{{ bf_phase == 'PROVISIONED_OFFLINE' and bf_offline_wg_conf_exists }}"
+        bf_firstboot_conflict: "{{ bf_phase == 'PENDING' and bf_firstboot_marker_exists }}"
+
+    - name: Yerel kanıt çelişkisini tek etikete indir
+      ansible.builtin.set_fact:
+        bf_phase_conflict_line: >-
+          {{ 'OFFLINE_WG_CONFLICT' if bf_offline_wg_conflict | bool
+             else ('FIRSTBOOT_CONFLICT' if bf_firstboot_conflict | bool else 'OK') }}
+
+    - name: Cihaz provisioning satırını raporla
+      ansible.builtin.debug:
+        msg: >-
+          {{ bf_device_id }} phase={{ bf_phase }} enrollment={{ bf_enrollment_status }} fleet={{ bf_fleet_status }}
+          state.json={{ bf_state_status }} provisioning_id={{ 'SET' if bf_provisioning_id_present else 'ABSENT' }}
+          firstboot_damgasi={{ 'VAR' if bf_firstboot_marker_exists else 'YOK' }}
+
+    - name: Henüz provision edilmemiş cihazı işaretle
+      ansible.builtin.debug:
+        msg: "UYARI {{ bf_device_id }}: provisioning fazı {{ bf_phase }}; cihaz kurulum/enrollment bekliyor."
+      when: bf_phase in ['PENDING', 'INVALID']
+
+    - name: PROVISIONED_OFFLINE cihazda WireGuard hub yapılandırması çelişkisini işaretle
+      ansible.builtin.debug:
+        msg: "UYARI {{ bf_device_id }}: faz PROVISIONED_OFFLINE ama /etc/wireguard/wg0.conf var; offline provisioning hub config yazmamalıdır (docs/27)."
+      when: bf_offline_wg_conflict | bool
+
+    - name: Damgasız firstboot çelişkisini işaretle
+      ansible.builtin.debug:
+        msg: "UYARI {{ bf_device_id }}: state.json yok ama firstboot damgası var; kurulum yarım kalmış olabilir (bkz. docs/05 modül 18)."
+      when: bf_firstboot_conflict | bool
+
+    - name: Faz dağılımını hesapla (faz -> cihaz sayısı)
+      ansible.builtin.set_fact:
+        bf_phase_histogram: "{{ bf_phase_histogram | default({}) | combine({ item: bf_wave_phases | select('equalto', item) | list | length }) }}"
+      loop: "{{ bf_wave_phases | unique | sort }}"
+      vars:
+        bf_wave_phases: "{{ ansible_play_hosts_all | map('extract', hostvars, 'bf_phase') | map('default', 'INVALID', true) | list }}"
+      run_once: true
+
+    - name: Dalga provisioning özetini yaz
+      ansible.builtin.debug:
+        msg:
+          - "Dalga {{ operation_wave }} | raporlanan cihaz: {{ ansible_play_hosts_all | length }}"
+          - "Faz dağılımı: {{ bf_phase_histogram | default({}) }}"
+          - "Kanıtsız/geçersiz cihazlar: {{ bf_unprovisioned_hosts }}"
+      vars:
+        bf_unprovisioned_hosts: "{{ dict(ansible_play_hosts_all | zip(ansible_play_hosts_all | map('extract', hostvars, 'bf_phase') | map('default', 'INVALID', true) | list)) | dict2items | rejectattr('value', 'in', provisioning_canonical_phases) | map(attribute='key') | list }}"
+      run_once: true
+
+    - name: Yerel kanıt çelişkisi olan cihazların dalga listesini yaz
+      ansible.builtin.debug:
+        msg: "Çelişkili cihazlar (offline wg0.conf / damgasız firstboot): {{ bf_conflict_hosts }}"
+      vars:
+        bf_conflict_hosts: "{{ dict(ansible_play_hosts_all | zip(ansible_play_hosts_all | map('extract', hostvars, 'bf_phase_conflict_line') | map('default', 'OK', true) | list)) | dict2items | rejectattr('value', 'equalto', 'OK') | map(attribute='key') | list }}"
+      run_once: true

@@ -30,7 +30,7 @@ LİSANS:   Yok (şirket içi script).
 
 ```text
 KARAR:    Kurucu 18 modülden oluşur (`01-precheck` … `18-final-check`); her modül idempotenttir — yeniden koşu güvenli ve kaldığı yerden tamamlayıcıdır.
-GEREKÇE:  Saha elektriği/kesintisi yarım kurulum üretir; idempotency olmadan her kesinti temiz-kurulum demektir. Final-check kapısı (modül 18) exit 0 vermeden cihaz READY sayılmaz.
+GEREKÇE:  Saha elektriği/kesintisi yarım kurulum üretir; idempotency olmadan her kesinti temiz-kurulum demektir. Final-check kapısı (modül 18) exit 0 vermeden cihaz kurulu sayılmaz; offline akışta sonuç `PROVISIONED_OFFLINE`, token sonrası `ENROLLED`, yalnız merkezi kanallar doğrulanınca `READY` olur (27/29).
 ALTERNATİF: Tek seferlik (non-idempotent) script — kesinti durumunda belirsiz ara durum nedeniyle elendi.
 RİSK:     Modülün idempotent yazılmaması (çift kayıt, çift key); azaltma: §10'daki çift-koşu testi her modül için zorunlu.
 MALİYET:  Ücretsiz.

@@ -1,0 +1,32 @@
+---
+# Report pending security updates only. NEVER installs anything.
+# Policy docs/10: unattended upgrades are disabled; every change needs an approval wave.
+# Run: ansible-playbook -i inventory/hosts.yml playbooks/bf-security-updates-check.yml --limit lab
+# No Semaphore Pro feature is used.
+- name: Report pending security updates (no install)
+  hosts: blueforce
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Refresh apt metadata (cache only, no upgrade)
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: List upgradable packages
+      ansible.builtin.shell: "apt list --upgradable 2>/dev/null"
+      register: upgradable
+      changed_when: false
+
+    - name: List security updates only
+      ansible.builtin.shell: "apt-get -s dist-upgrade -V | grep -i security || true"
+      register: sec_updates
+      changed_when: false
+
+    - name: Show report
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} upgradable:\n{{ upgradable.stdout }}\nsecurity:\n{{ sec_updates.stdout | default('(none)') }}"
+
+    - name: Remind operator that install is out of scope
+      ansible.builtin.debug:
+        msg: "REPORT ONLY - use bf-deploy-update.yml with approval waves to install anything."

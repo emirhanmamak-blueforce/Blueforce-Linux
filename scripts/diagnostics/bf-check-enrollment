@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+#
+# bf-check-enrollment - ENROLLED level gate (fail closed).
+#
+# Proves the middle stage of the lifecycle without trusting the persisted phase
+# alone:
+#   * the lifecycle state file is contract-valid and carries the central
+#     verification record produced by the validated enrollment response,
+#   * phase is ENROLLED or READY and enrollment_status is ENROLLED or COMPLETE
+#     (a skipped PROVISIONED_OFFLINE -> READY transition never passes),
+#   * the assigned WireGuard peer configuration exists and is root-only,
+#   * wg-quick@wg0 is enabled and active with the interface up and at least one
+#     handshake fresher than BF_WG_HANDSHAKE_MAX_AGE.
+#
+# A missing WireGuard handshake FAILS at this level (and at READY). It is only
+# acceptable at the PROVISIONED_OFFLINE level, which bf-check-local owns.
+# Without central evidence the gate never passes.
+#
+# Usage: bf-check-enrollment [--check] [--help]
+# Exit status: 0 all enrollment gates passed, 1 at least one gate failed.
+set -euo pipefail
+
+STATE_FILE="${BF_STATE_FILE:-${STATE_DIR:-/var/lib/blueforce}/state.json}"
+WG_DIR="${WG_DIR:-/etc/wireguard}"
+MAX_AGE="${BF_WG_HANDSHAKE_MAX_AGE:-180}"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+fails=0
+pass() { printf 'PASS: %s\n' "$1"; }
+fail() { printf 'FAIL: %s\n' "$1"; fails=$((fails + 1)); }
+
+usage() {
+    cat <<'EOF'
+Usage: bf-check-enrollment [--check]
+
+Verify the ENROLLED gates: contract-valid state with central verification
+evidence, assigned WireGuard peer configuration, live tunnel and a fresh
+handshake (BF_WG_HANDSHAKE_MAX_AGE, default 180s).
+
+Exit status: 0 all gates pass, 1 otherwise (fail closed without central evidence).
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check) shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+[[ "$MAX_AGE" =~ ^[1-9][0-9]*$ ]] || { echo 'ERROR: BF_WG_HANDSHAKE_MAX_AGE must be positive seconds' >&2; exit 2; }
+
+mode_bits() { stat -c '%a' "$1" 2>/dev/null || printf ''; }
+wide_mode() {
+    local mode
+    mode="$(mode_bits "$1")"
+    [[ -n "$mode" ]] || return 1
+    ((8#$mode & 8#077))
+}
+
+# 1. Lifecycle contract plus the central verification record. bf-enrollment-status
+#    refuses ENROLLED/READY states without well-formed central evidence.
+if output="$("$SELF_DIR/bf-enrollment-status" 2>&1)"; then
+    pass 'lifecycle state contract valid (central verification record present)'
+else
+    fail 'lifecycle state contract invalid or central verification evidence missing'
+    printf '%s\n' "$output" >&2
+fi
+phase="$("$SELF_DIR/bf-enrollment-status" --field phase 2>/dev/null)" || phase=''
+enrollment="$("$SELF_DIR/bf-enrollment-status" --field enrollment 2>/dev/null)" || enrollment=''
+
+if [[ "$phase" == 'ENROLLED' || "$phase" == 'READY' ]]; then
+    pass "lifecycle phase is $phase"
+else
+    fail "lifecycle phase is ${phase:-missing}, expected ENROLLED or READY"
+fi
+if [[ "$enrollment" == 'ENROLLED' || "$enrollment" == 'COMPLETE' ]]; then
+    pass "enrollment_status is $enrollment"
+else
+    fail "enrollment_status is ${enrollment:-missing}, expected ENROLLED or COMPLETE"
+fi
+if [[ ! -e "$STATE_FILE" ]]; then
+    fail "state file missing: $STATE_FILE"
+elif wide_mode "$STATE_FILE"; then
+    fail "state file mode is $(mode_bits "$STATE_FILE"); the contract requires 0600"
+else
+    pass 'state file permissions are root-only'
+fi
+
+# 2. Assigned WireGuard peer configuration (written by bf-enroll, never by the
+#    offline installer and never carrying a server-supplied private key).
+if [[ -s "$WG_DIR/wg0.conf" ]]; then
+    pass "assigned WireGuard configuration present: $WG_DIR/wg0.conf"
+    if wide_mode "$WG_DIR/wg0.conf"; then
+        fail "wg0.conf mode is $(mode_bits "$WG_DIR/wg0.conf"); it must be root-only (0600)"
+    else
+        pass 'wg0.conf is root-only'
+    fi
+    for field in '\[Interface\]' '^PrivateKey = ' '^Address = ' '\[Peer\]' '^PublicKey = ' '^Endpoint = ' '^AllowedIPs = '; do
+        if grep -Eq "$field" "$WG_DIR/wg0.conf"; then
+            pass "wg0.conf declares ${field//\\/}"
+        else
+            fail "wg0.conf is missing ${field//\\/}"
+        fi
+    done
+else
+    fail "assigned WireGuard configuration missing: $WG_DIR/wg0.conf"
+fi
+
+# 3. Runtime tunnel state.
+if systemctl is-enabled --quiet wg-quick@wg0 2>/dev/null; then
+    pass 'wg-quick@wg0 is enabled'
+else
+    fail 'wg-quick@wg0 is not enabled'
+fi
+if systemctl is-active --quiet wg-quick@wg0 2>/dev/null; then
+    pass 'wg-quick@wg0 is active'
+else
+    fail 'wg-quick@wg0 is not active'
+fi
+if command -v ip >/dev/null 2>&1 && ip link show wg0 >/dev/null 2>&1; then
+    pass 'wg0 interface is present'
+else
+    fail 'wg0 interface is missing'
+fi
+
+# 4. Fresh handshake: proof the assigned peer actually reaches central.
+if ! command -v wg >/dev/null 2>&1; then
+    fail 'wg tool missing: handshake cannot be proven'
+elif wg show wg0 latest-handshakes 2>/dev/null | awk -v now="$(date +%s)" -v max="$MAX_AGE" '$2 > 0 && now - $2 <= max { ok = 1 } END { exit !ok }'; then
+    pass "WireGuard handshake is fresher than ${MAX_AGE}s"
+else
+    fail "WireGuard handshake missing or older than ${MAX_AGE}s"
+fi
+
+if [[ "$fails" -ne 0 ]]; then
+    printf 'bf-check-enrollment: FAILED (%s enrollment gate(s)); device stays ENROLLED or PROVISIONED_OFFLINE\n' "$fails"
+    exit 1
+fi
+printf 'bf-check-enrollment: enrollment gates PASS\n'

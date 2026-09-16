@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+#
+# bf-gui-on - Switch the field terminal to graphical mode and prepare RDP.
+#
+# Enables and starts the display manager plus xRDP services, isolates the
+# graphical target, then waits until RDP is ready to accept sessions.
+# Idempotent: already-graphical systems are left untouched.
+#
+# Install: install -m 0755 bf-gui-on /usr/local/bin/bf-gui-on
+# Usage: sudo bf-gui-on [--timeout SECS]
+#
+set -euo pipefail
+
+TIMEOUT=60
+DISPLAY_MANAGER=""
+
+usage() {
+    cat <<'EOF'
+Usage: bf-gui-on [--timeout SECS] [--help]
+
+Switch the device to graphical mode and wait until RDP is ready.
+
+Options:
+  --timeout SECS   Seconds to wait for RDP port 3389 (default: 60)
+  --help           Show this help and exit
+
+Behavior:
+  - Enables and starts the display manager (gdm3/gdm) + xrdp + xrdp-sesman
+  - Runs 'systemctl isolate graphical.target'
+  - Waits until TCP/3389 accepts connections (RDP ready standby)
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --timeout) TIMEOUT="${2:?missing value for --timeout}"; shift 2 ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "ERROR: bf-gui-on must run as root (use sudo)." >&2
+    exit 1
+fi
+
+log() { echo "[bf-gui-on] $*"; }
+
+# Detect installed display manager unit (LAB validates exact names on 26.04.1).
+detect_dm() {
+    local candidate
+    for candidate in gdm3.service gdm.service sddm.service lightdm.service; do
+        if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${candidate}"; then
+            echo "${candidate%.service}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if DISPLAY_MANAGER="$(detect_dm)"; then
+    log "Display manager detected: ${DISPLAY_MANAGER}"
+else
+    log "WARNING: no display manager unit found; proceeding with xrdp only."
+fi
+
+UNITS=()
+[[ -n "${DISPLAY_MANAGER}" ]] && UNITS+=("${DISPLAY_MANAGER}")
+UNITS+=(xrdp xrdp-sesman)
+
+# Enable units that exist so GUI survives reboot while switched on.
+for unit in "${UNITS[@]}"; do
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${unit}"; then
+        systemctl enable "${unit}" >/dev/null 2>&1 || true
+    else
+        log "WARNING: unit ${unit} not installed; skipping."
+    fi
+done
+
+CURRENT="$(systemctl get-default 2>/dev/null || echo unknown)"
+log "Current default target: ${CURRENT}"
+
+log "Isolating graphical.target ..."
+systemctl isolate graphical.target
+
+for unit in "${UNITS[@]}"; do
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${unit}"; then
+        if ! systemctl is-active --quiet "${unit}"; then
+            log "Starting ${unit} ..."
+            systemctl start "${unit}" || log "WARNING: failed to start ${unit}."
+        else
+            log "${unit} already active."
+        fi
+    fi
+done
+
+# Wait for RDP standby on TCP/3389.
+log "Waiting for RDP (TCP/3389) up to ${TIMEOUT}s ..."
+elapsed=0
+while [[ "${elapsed}" -lt "${TIMEOUT}" ]]; do
+    if (exec 3<>/dev/tcp/127.0.0.1/3389) >/dev/null 2>&1; then
+        exec 3>&- 2>/dev/null || true
+        log "RDP is ready (graphical ON)."
+        exit 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+done
+
+echo "ERROR: RDP port 3389 did not open within ${TIMEOUT}s." >&2
+echo "HINT: check 'systemctl status xrdp xrdp-sesman' and journal." >&2
+exit 1

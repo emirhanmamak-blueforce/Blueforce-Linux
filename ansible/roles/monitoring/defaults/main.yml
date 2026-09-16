@@ -1,0 +1,7 @@
+---
+# Defaults for the monitoring role.
+monitoring_packages:
+  - prometheus-node-exporter
+monitoring_service: prometheus-node-exporter
+monitoring_endpoint: http://monitoring.example.com:8428
+monitoring_job: blueforce

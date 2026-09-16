@@ -1,0 +1,6 @@
+node_modules/
+build/
+.docusaurus/
+# Generated content (recreated by sync-docs.sh on prestart/prebuild).
+docs/*.md
+!docs/.gitkeep

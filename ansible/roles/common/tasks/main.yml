@@ -1,0 +1,37 @@
+---
+# Common baseline: users, time, unattended-upgrades OFF (docs/10), base packages.
+# No Semaphore Pro feature is used.
+- name: Ensure base packages are present
+  ansible.builtin.apt:
+    name:
+      - openssh-server
+      - python3
+      - curl
+      - htop
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Disable automatic upgrades (policy docs/10)
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      APT::Periodic::Update-Package-Lists "0";
+      APT::Periodic::Unattended-Upgrade "0";
+
+- name: Mask apt-daily timers (policy docs/10)
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    masked: true
+    state: stopped
+  loop:
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+  failed_when: false
+
+- name: Set timezone
+  ansible.builtin.timezone:
+    name: "{{ common_timezone }}"

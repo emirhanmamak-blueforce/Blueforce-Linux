@@ -1,0 +1,24 @@
+---
+# Report Docker daemon and container status (read-only).
+# Run: ansible-playbook -i inventory/hosts.yml playbooks/bf-docker-status.yml --limit lab
+# No changes are made by this playbook. No Semaphore Pro feature is used.
+- name: Check Docker status
+  hosts: blueforce
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Check Docker service state
+      ansible.builtin.systemd:
+        name: docker
+      register: docker_svc
+      changed_when: false
+
+    - name: List running containers
+      ansible.builtin.command: docker ps --format '{{{{.Names}}}} {{{{.Image}}}} {{{{.Status}}}}'
+      register: docker_ps
+      changed_when: false
+      failed_when: false
+
+    - name: Show Docker status
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} docker={{ docker_svc.status.ActiveState | default('unknown') }} containers={{ docker_ps.stdout_lines | default([]) }}"

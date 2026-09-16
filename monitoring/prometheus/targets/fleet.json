@@ -1,0 +1,10 @@
+[
+  {
+    "targets": ["10.7.0.11"],
+    "labels": {
+      "device_id": "BF-12010193",
+      "site": "pilot",
+      "job": "node"
+    }
+  }
+]

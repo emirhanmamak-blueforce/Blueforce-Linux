@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+#
+# bf-support-bundle - Collect a secret-free support tarball for a Blueforce field terminal.
+#
+# Gathers bf-status + bf-diagnostics output, journal tail, textfile collectors
+# and basic system facts into a tar.gz. Files matching secret patterns
+# (*.key, *secret*, password material, private keys) are NEVER included,
+# and key-like values in captured command output are redacted.
+# A manifest.txt inside the bundle lists every file + collection time.
+#
+# Output contract: docs/14-MONITORING-AND-HEALTH.md ("bf-support-bundle ...
+# secret ... ASLA pakete girmez").
+#
+# Install: install -m 0755 bf-support-bundle /usr/local/bin/bf-support-bundle
+# Usage: bf-support-bundle [--out-dir DIR] [--help]
+#
+set -euo pipefail
+
+OUT_DIR="/var/tmp"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+    cat <<'EOF'
+Usage: bf-support-bundle [--out-dir DIR] [--help]
+
+Collect a secret-free support bundle (tar.gz with manifest.txt).
+
+Options:
+  --out-dir DIR   Directory for the tarball (default: /var/tmp)
+  --help          Show this help and exit
+
+Excluded (never packaged):
+  *.key, *secret*, *password*, *passwd*, *private*,
+  *id_rsa*, *id_ed25519*, *.pem, WireGuard private keys,
+  RustDesk passwords, SSH private keys.
+
+Manifest:
+  manifest.txt inside the tarball lists each file, byte size,
+  collection timestamp, and the exclusion patterns applied.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --out-dir) OUT_DIR="${2:?missing value for --out-dir}"; shift 2 ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+HOST="$(hostname 2>/dev/null || echo unknown)"
+STAMP="$(date '+%Y%m%d-%H%M%S' 2>/dev/null || echo unknown)"
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK}"' EXIT
+
+BUNDLE_NAME="blueforce-support-${HOST}-${STAMP}"
+STAGE="${WORK}/${BUNDLE_NAME}"
+mkdir -p "${STAGE}"
+
+log() { echo "[bf-support-bundle] $*" >&2; }
+
+# Exclude patterns: filename-level, applied to every copy step and tar.
+EXCLUDE_PATTERNS=(
+    '*.key' '*secret*' '*password*' '*passwd*' '*private*'
+    '*id_rsa*' '*id_ed25519*' '*.pem' '*.p12' '*.pfx'
+)
+is_excluded() { # $1 = basename
+    local base="$1" pat
+    for pat in "${EXCLUDE_PATTERNS[@]}"; do
+        # shellcheck disable=SC2053
+        [[ "${base}" == ${pat} ]] && return 0
+    done
+    return 1
+}
+
+redact() { # stdin -> stdout: mask key-like values
+    sed -E \
+        -e 's/(private-key|public-key|preshared-key)([[:space:]]*[:=][[:space:]]*).*/\1\2<redacted>/I' \
+        -e 's/(password|passwd|secret|token)([[:space:]]*[:=][[:space:]]*)[^[:space:]]+/\1\2<redacted>/I'
+}
+
+collect_cmd() { # $1 = outfile, $@ = command
+    local out="$1"; shift
+    { "$@" 2>&1 || echo "(command failed: $*)"; } | redact > "${out}" || true
+}
+
+log "collecting into ${STAGE}"
+
+collect_cmd "${STAGE}/bf-status.txt" "${SCRIPT_DIR}/bf-status" || true
+if [[ -x "${SCRIPT_DIR}/bf-diagnostics" ]]; then
+    collect_cmd "${STAGE}/bf-diagnostics.txt" "${SCRIPT_DIR}/bf-diagnostics" || true
+fi
+collect_cmd "${STAGE}/system.txt" bash -c 'hostname; uptime; uname -a; systemctl get-default 2>/dev/null || echo "target: unknown"'
+collect_cmd "${STAGE}/disk-df.txt" bash -c 'df -h / /var 2>/dev/null; echo ---; df -i / /var 2>/dev/null'
+collect_cmd "${STAGE}/sockets.txt" bash -c 'ss -ltnp 2>/dev/null || ss -ltn 2>/dev/null || echo "ss not available"'
+collect_cmd "${STAGE}/failed-units.txt" bash -c 'systemctl --failed --no-pager 2>/dev/null || echo "no failed units"'
+
+if command -v journalctl >/dev/null 2>&1; then
+    journalctl --since "24 hours ago" -p err --no-pager -o short 2>/dev/null | redact | tail -200 > "${STAGE}/journal-err-24h.txt" || echo "no journal access" > "${STAGE}/journal-err-24h.txt"
+else
+    echo "journalctl not available." > "${STAGE}/journal-err-24h.txt"
+fi
+
+if command -v wg >/dev/null 2>&1; then
+    { wg show 2>/dev/null | redact || echo "no WireGuard interfaces"; echo "--- latest handshakes ---"; wg show all latest-handshakes 2>/dev/null || echo "no handshake data"; } > "${STAGE}/wireguard.txt" || true
+else
+    echo "wg tool not installed." > "${STAGE}/wireguard.txt"
+fi
+
+# Textfile collectors: copy *.prom only, never anything matching excludes.
+mkdir -p "${STAGE}/textfile"
+if [[ -d /var/lib/node_exporter/textfile ]]; then
+    while IFS= read -r -d '' f; do
+        base="$(basename "${f}")"
+        if is_excluded "${base}"; then
+            log "skipping excluded file: ${base}"
+            continue
+        fi
+        cp "${f}" "${STAGE}/textfile/${base}" 2>/dev/null || true
+    done < <(find /var/lib/node_exporter/textfile -maxdepth 1 -name '*.prom' -type f -print0 2>/dev/null || true)
+    if [[ -z "$(ls -A "${STAGE}/textfile" 2>/dev/null)" ]]; then
+        echo "textfile dir empty." > "${STAGE}/textfile/README.txt"
+    fi
+else
+    echo "textfile dir missing." > "${STAGE}/textfile/README.txt"
+fi
+
+# Manifest: file list + sizes + timestamp + exclusion rules.
+{
+    echo "blueforce support bundle manifest"
+    echo "host: ${HOST}"
+    echo "collected_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)"
+    echo "generator: bf-support-bundle"
+    echo "excluded_patterns: ${EXCLUDE_PATTERNS[*]}"
+    echo "note: secrets, private keys and passwords are never included; key-like values redacted."
+    echo ""
+    echo "files:"
+    ( cd "${STAGE}" && find . -type f -printf '%p %s bytes\n' 2>/dev/null | sort ) || ( cd "${STAGE}" && find . -type f -exec wc -c {} + | sort )
+} > "${STAGE}/manifest.txt"
+
+mkdir -p "${OUT_DIR}"
+TARBALL="${OUT_DIR}/${BUNDLE_NAME}.tar.gz"
+tar --sort=name --mtime='UTC 2020-01-01' \
+    --exclude='*.key' --exclude='*secret*' --exclude='*password*' \
+    --exclude='*passwd*' --exclude='*private*' \
+    --exclude='*id_rsa*' --exclude='*id_ed25519*' --exclude='*.pem' \
+    -czf "${TARBALL}" -C "${WORK}" "${BUNDLE_NAME}"
+
+log "wrote ${TARBALL}"
+echo "${TARBALL}"

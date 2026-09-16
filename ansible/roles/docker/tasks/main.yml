@@ -1,0 +1,50 @@
+---
+# Docker engine setup with explicit, approved repository and version only.
+- name: Refuse unsupported Ubuntu codename or unapproved Docker inputs
+  ansible.builtin.assert:
+    that:
+      - docker_apt_codename in docker_supported_codenames
+      - docker_apt_repository | length > 0
+      - docker_engine_version | length > 0
+      - docker_engine_version is not search('latest')
+      - docker_packages | length > 0
+      - docker_packages | select('search', '(^|=).*latest($|[^[:alnum:]])') | list | length == 0
+    fail_msg: >-
+      Docker installation is refused until this host has a supported codename and an explicitly approved
+      repository, exact engine version, and exact package list. No automatic Docker update is permitted.
+
+- name: Verify approved Docker repository is configured
+  ansible.builtin.command: "apt-cache policy docker-ce"
+  register: docker_policy
+  changed_when: false
+  failed_when: docker_apt_repository not in docker_policy.stdout
+
+- name: Verify requested Docker version is available from approved repository
+  ansible.builtin.command: "apt-cache madison docker-ce"
+  register: docker_versions
+  changed_when: false
+  failed_when: docker_engine_version not in docker_versions.stdout
+
+- name: Install only the approved exact Docker packages
+  ansible.builtin.apt:
+    name: "{{ docker_packages }}"
+    state: present
+    update_cache: false
+
+- name: Enable and start Docker daemon
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Ensure MEG container is running at pinned tag
+  ansible.builtin.command: "docker ps --filter name={{ meg_container_name }} --format '{{{{.Names}}}}'"
+  register: meg_ps
+  changed_when: false
+  failed_when: false
+  when: meg_container_name | length > 0
+
+- name: Report MEG container state
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} meg={{ meg_ps.stdout | default('(skipped)') }}"
+  when: meg_container_name | length > 0

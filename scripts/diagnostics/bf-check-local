@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+#
+# bf-check-local - PROVISIONED_OFFLINE level gate (local proof only).
+#
+# This gate must PASS on a device that has never reached the internet:
+#   * it performs no DNS, HTTP or central call at all,
+#   * a missing wg0.conf or a missing WireGuard handshake is reported as WARN
+#     because enrollment has not happened yet - it is never a failure here,
+#   * WireGuard handshake freshness belongs to bf-check-enrollment (ENROLLED)
+#     and bf-check-ready (READY) only.
+#
+# Usage: bf-check-local [--check] [--help]
+#   --check  accepted for symmetry with the installer modules; checks never
+#            mutate anything, so --check and the default are identical.
+#
+# Exit status: 0 every local gate passed, 1 at least one gate failed.
+# Never prints secrets.
+#
+set -euo pipefail
+
+STATE_FILE="${BF_STATE_FILE:-${STATE_DIR:-/var/lib/blueforce}/state.json}"
+WG_DIR="${WG_DIR:-/etc/wireguard}"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+fails=0
+pass() { printf 'PASS: %s\n' "$1"; }
+fail() { printf 'FAIL: %s\n' "$1"; fails=$((fails + 1)); }
+warn() { printf 'WARN: %s\n' "$1"; }
+info() { printf 'INFO: %s\n' "$1"; }
+
+usage() {
+    cat <<'EOF'
+Usage: bf-check-local [--check]
+
+Verify the local, pre-enrollment (PROVISIONED_OFFLINE) gates:
+  * lifecycle state file present and contract-valid,
+  * WireGuard device keypair present, root-only and self-consistent,
+  * xrdp and xrdp-sesman enabled and active,
+  * default systemd target is multi-user.target.
+
+No internet, no WireGuard handshake and no central evidence is required.
+Exit status: 0 all gates pass, 1 at least one gate failed.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check) shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+mode_bits() { stat -c '%a' "$1" 2>/dev/null || printf ''; }
+# True when a file is readable/writable beyond its owner.
+wide_mode() {
+    local mode
+    mode="$(mode_bits "$1")"
+    [[ -n "$mode" ]] || return 1
+    ((8#$mode & 8#077))
+}
+
+info 'local-only gate: no internet, no WireGuard handshake and no central evidence is required'
+
+# 1. Lifecycle state contract. bf-enrollment-status owns the validation rules.
+if "$SELF_DIR/bf-enrollment-status" >/dev/null 2>&1; then
+    pass 'lifecycle state file present and contract-valid'
+else
+    fail 'lifecycle state file missing or contract-invalid (run bf-enrollment-status)'
+fi
+phase="$("$SELF_DIR/bf-enrollment-status" --field phase 2>/dev/null)" || phase=''
+if [[ "$phase" =~ ^(PROVISIONED_OFFLINE|ENROLLED|READY)$ ]]; then
+    pass "lifecycle phase is $phase"
+else
+    fail 'lifecycle phase is missing or invalid'
+fi
+if [[ -r "$STATE_FILE" ]]; then
+    pass "state file readable: $STATE_FILE"
+else
+    fail "state file not readable: $STATE_FILE"
+fi
+if wide_mode "$STATE_FILE"; then
+    warn "state file mode is $(mode_bits "$STATE_FILE"); the contract requires 0600"
+fi
+
+# 2. WireGuard device identity. The private key is a device-only secret: it must
+#    exist, be unreadable by group/other, and belong to the public key that
+#    enrollment publishes.
+if [[ -s "$WG_DIR/privatekey" ]]; then
+    pass 'WireGuard private key present'
+else
+    fail "WireGuard private key missing or empty: $WG_DIR/privatekey"
+fi
+if [[ -e "$WG_DIR/privatekey" ]]; then
+    if wide_mode "$WG_DIR/privatekey"; then
+        fail "WireGuard private key mode is $(mode_bits "$WG_DIR/privatekey"); it must be root-only (0600)"
+    else
+        pass 'WireGuard private key is root-only'
+    fi
+fi
+if [[ -s "$WG_DIR/publickey" ]]; then
+    pass 'WireGuard public key present'
+else
+    fail "WireGuard public key missing or empty: $WG_DIR/publickey"
+fi
+if command -v wg >/dev/null 2>&1 && [[ -s "$WG_DIR/privatekey" && -s "$WG_DIR/publickey" ]]; then
+    derived="$(wg pubkey < "$WG_DIR/privatekey" 2>/dev/null | tr -d '[:space:]')" || derived=''
+    if [[ -n "$derived" && "$derived" == "$(tr -d '[:space:]' < "$WG_DIR/publickey")" ]]; then
+        pass 'WireGuard keypair is self-consistent'
+    else
+        fail 'WireGuard public key does not match the local private key'
+    fi
+else
+    warn 'wg tool unavailable: keypair consistency not verified'
+fi
+
+# 3. Local access services (the field technician path must work offline).
+if systemctl is-enabled --quiet xrdp 2>/dev/null && systemctl is-active --quiet xrdp 2>/dev/null; then
+    pass 'xrdp enabled and active'
+else
+    fail 'xrdp is not enabled and active'
+fi
+if systemctl is-enabled --quiet xrdp-sesman 2>/dev/null && systemctl is-active --quiet xrdp-sesman 2>/dev/null; then
+    pass 'xrdp-sesman enabled and active'
+else
+    fail 'xrdp-sesman is not enabled and active'
+fi
+if [[ "$(systemctl get-default 2>/dev/null)" == 'multi-user.target' ]]; then
+    pass 'default target is multi-user.target'
+else
+    fail "default target is $(systemctl get-default 2>/dev/null || echo unknown), expected multi-user.target"
+fi
+
+# 4. Post-enrollment artifacts are explicitly out of scope here.
+if [[ -e "$WG_DIR/wg0.conf" ]]; then
+    info 'wg0.conf present (enrollment already ran); handshake belongs to bf-check-enrollment'
+else
+    warn 'wg0.conf absent: not enrolled yet, which is expected before enrollment'
+fi
+
+if [[ "$fails" -ne 0 ]]; then
+    printf 'bf-check-local: FAILED (%s local gate(s))\n' "$fails"
+    exit 1
+fi
+printf 'bf-check-local: local gates PASS (offline-safe, no central evidence required)\n'

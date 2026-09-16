@@ -1,0 +1,20 @@
+# Purpose: Rotate MEG and Blueforce application logs to cap disk use.
+# Scope: /var/log/blueforce and /var/log/meg file logs; install to /etc/logrotate.d/.
+# Safety: Idempotent under logrotate; validate with logrotate -d before deploying.
+# Ref: docs/15-LOGGING.md, K-14.
+/var/log/blueforce/*.log /var/log/meg/*.log {
+  weekly
+  rotate 7
+  size 10M
+  maxage 30
+  compress
+  delaycompress
+  missingok
+  notifempty
+  create 0640 root adm
+  sharedscripts
+  postrotate
+    /usr/bin/systemctl kill --signal=SIGHUP rsyslog.service >/dev/null 2>&1 || true
+  endscript
+}
+# NOTE: install.log and update-history.log stay append-only and are excluded here.

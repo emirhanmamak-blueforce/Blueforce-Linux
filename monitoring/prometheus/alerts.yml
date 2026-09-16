@@ -1,0 +1,54 @@
+# Fleet alert rules. Severity: critical pages the on-call admin (14-MONITORING).
+# Notification endpoints (SMS/e-mail/webhook) are wired in the central
+# Grafana Alerting / Alertmanager setup, not in this file.
+# All expressions assume 60s scrape interval.
+
+groups:
+  - name: fleet
+    interval: 60s
+    rules:
+      # Device does not answer scrapes for 5 minutes -> presumed offline.
+      - alert: FleetOffline
+        expr: up{job="node"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Device {{ $labels.device_id }} is offline"
+          description: "No successful scrape for 5m (instance {{ $labels.instance }}). Check Uptime Kuma last-seen and field power/network."
+
+      # Root filesystem less than 10% available for 10 minutes.
+      - alert: FleetDiskFull
+        expr: |
+          (
+            node_filesystem_avail_bytes{job="node", mountpoint="/", fstype!~"tmpfs|overlay"}
+            /
+            node_filesystem_size_bytes{job="node", mountpoint="/", fstype!~"tmpfs|overlay"}
+          ) < 0.10
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Device {{ $labels.device_id }} disk almost full"
+          description: "Root filesystem <10% available for 10m on {{ $labels.instance }}."
+
+      # Boot time changed recently -> unexpected reboot (power loss or crash).
+      - alert: FleetUnexpectedReboot
+        expr: time() - node_boot_time_seconds{job="node"} < 15 * 60
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Device {{ $labels.device_id }} rebooted unexpectedly"
+          description: "{{ $labels.instance }} booted less than 15m ago. Correlate with power-loss recovery (16-POWER-LOSS)."
+
+      # unattended-upgrades must stay DISABLED (K-11); 1 means the lock was broken.
+      # Source: textfile metric unattended_upgrade_active.
+      - alert: FleetSecurityUpdatesViolation
+        expr: unattended_upgrade_active{job="node"} == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Device {{ $labels.device_id }} has unattended-upgrades enabled"
+          description: "Update policy lock (K-11) violated on {{ $labels.instance }}. Disable unattended-upgrades per 10-UPDATE."

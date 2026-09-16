@@ -1,0 +1,609 @@
+#!/usr/bin/env bash
+#
+# bf-enroll - one-time enrollment client for a PROVISIONED_OFFLINE device.
+#
+# Security contract (docs/29-DEVICE-ENROLLMENT.md, provisioning/enrollment/README.md):
+#   * The one-time token is read from stdin (--token-stdin) or from a root-only
+#     single-use file staged for the boot timer (--systemd / --stage). It is
+#     never taken from argv, never logged, never written into the lifecycle
+#     state, a support bundle or removable media.
+#   * The WireGuard private key never leaves the device. The request carries only
+#     the public key plus non-secret hardware/release facts; the WireGuard
+#     configuration is assembled locally from the local private key and the
+#     validated peer fields of the response. A response that tries to inject a
+#     private key or an unexpected field is rejected.
+#   * The idempotency key is derived deterministically from
+#     provisioning_id + BF-<no> + public key, so central can deduplicate retries
+#     of the same device/release while the token itself stays single-use.
+#   * Every state update is an atomic tmp+rename write with mode 0600 and a
+#     forward-only transition check under a lock.
+#
+# Lifecycle (forward-only, never skipping a stage):
+#   (none) -> PROVISIONED_OFFLINE -> ENROLLED -> READY
+#   * This script performs PROVISIONED_OFFLINE -> ENROLLED only.
+#   * ENROLLED may be re-applied with --reenroll (idempotent re-enrollment);
+#     the phase never moves backwards.
+#   * READY never returns to ENROLLED; re-provision from the offline media.
+#
+# Failure handling: a failed request or a failed WireGuard activation rolls the
+# configuration back and leaves the lifecycle at its prior state (PENDING or
+# PROVISIONED_OFFLINE). Nothing reboots and nothing retries in a loop; the
+# bounded retry lives in blueforce-enroll.service.
+#
+# Usage:
+#   bf-enroll --token-stdin [--reenroll] [--check]   immediate enrollment
+#   bf-enroll --token-stdin --stage [--check]        stage the token, enroll later
+#   bf-enroll --systemd [--check]                    attempt used by the boot timer
+#
+# Environment:
+#   BF_ENROLLMENT_ENDPOINT     HTTPS enrollment endpoint (central configuration)
+#   BF_ENROLLMENT_TIMEOUT      connect/max seconds per attempt (default 20)
+#   BF_ENROLLMENT_TOKEN_FILE   staged token path (default <state dir>/enrollment.token)
+#   BF_ENROLLMENT_TOKEN_MAX_AGE  staged token TTL in seconds (default 1800)
+#   BF_STATE_FILE / STATE_DIR / WG_DIR  test and installer overrides
+#
+set -euo pipefail
+umask 077
+
+STATE_DIR="${STATE_DIR:-/var/lib/blueforce}"
+STATE_FILE="${BF_STATE_FILE:-$STATE_DIR/state.json}"
+WG_DIR="${WG_DIR:-/etc/wireguard}"
+ENDPOINT="${BF_ENROLLMENT_ENDPOINT:-}"
+TIMEOUT="${BF_ENROLLMENT_TIMEOUT:-20}"
+TOKEN_FILE="${BF_ENROLLMENT_TOKEN_FILE:-$STATE_DIR/enrollment.token}"
+TOKEN_MAX_AGE="${BF_ENROLLMENT_TOKEN_MAX_AGE:-1800}"
+
+MODE=''
+STAGE=0
+REENROLL=0
+CHECK_MODE=0
+TOKEN=''
+HTTP_CODE=''
+REQUEST_FILE=''
+RESPONSE_FILE=''
+STAGED_CONFIG=''
+BACKUP_CONFIG=''
+CV_FILE=''
+
+usage() {
+    cat <<'EOF'
+Usage: bf-enroll --token-stdin [--reenroll] [--check]
+       bf-enroll --token-stdin --stage [--check]
+       bf-enroll --systemd [--check]
+
+Obtain the hub WireGuard peer configuration for a PROVISIONED_OFFLINE device
+and record the ENROLLED lifecycle phase.
+
+Token sources (a token is never accepted from argv and never logged):
+  --token-stdin   read the one-time token once from stdin and enroll now
+  --stage         store the stdin token as a root-only single-use file
+                  (mode 0600, TTL BF_ENROLLMENT_TOKEN_MAX_AGE) for the boot timer
+  --systemd       attempt used by blueforce-enroll.service: PENDING while no
+                  token is staged, transient failures exit non-zero so the
+                  bounded Restart= can retry, definitive rejections discard the
+                  staged token
+
+Options:
+  --reenroll      allow re-applying enrollment on a device already in ENROLLED
+                  (the phase never moves backwards; READY is refused)
+  --check         dry run: validate configuration and state, print the planned
+                  actions, write nothing and send nothing
+  --help          show this help
+
+Exit status: 0 success (or nothing to do), 1 failure, 2 usage error.
+EOF
+}
+
+die() { printf 'bf-enroll: %s\n' "$*" >&2; exit 1; }
+note() { printf 'bf-enroll: %s\n' "$*"; }
+
+# A lifecycle precondition that cannot be met. Interactive runs fail loudly,
+# the boot attempt reports PENDING and exits 0 so it never becomes a retry loop.
+gate_block() {
+    if [[ "$MODE" == 'systemd' ]]; then
+        printf 'bf-enroll: PENDING: %s\n' "$*" >&2
+        exit 0
+    fi
+    die "$*"
+}
+
+cleanup() {
+    unset TOKEN HTTP_CODE REQUEST_FILE RESPONSE_FILE STAGED_CONFIG BACKUP_CONFIG CV_FILE
+    return 0
+}
+trap cleanup EXIT
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --token-stdin)
+            [[ -z "$MODE" ]] || { echo 'ERROR: only one token source can be selected' >&2; exit 2; }
+            MODE='stdin'; shift ;;
+        --systemd)
+            [[ -z "$MODE" ]] || { echo 'ERROR: only one token source can be selected' >&2; exit 2; }
+            MODE='systemd'; shift ;;
+        --stage) STAGE=1; shift ;;
+        --reenroll) REENROLL=1; shift ;;
+        --check) CHECK_MODE=1; shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) printf 'ERROR: unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+[[ -n "$MODE" ]] || { usage >&2; exit 2; }
+if [[ "$STAGE" -eq 1 && "$MODE" != 'stdin' ]]; then
+    echo 'ERROR: --stage applies to --token-stdin only' >&2
+    exit 2
+fi
+
+[[ "$TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die 'BF_ENROLLMENT_TIMEOUT must be positive seconds'
+[[ "$TOKEN_MAX_AGE" =~ ^[1-9][0-9]*$ ]] || die 'BF_ENROLLMENT_TOKEN_MAX_AGE must be positive seconds'
+
+validate_endpoint() {
+    [[ "$ENDPOINT" =~ ^https://[^[:space:]/]+(/[^[:space:]]*)?$ ]] || die 'BF_ENROLLMENT_ENDPOINT must be a non-placeholder HTTPS URL'
+    case "$ENDPOINT" in
+        *example*|*invalid*|*'<'*|*'>'*) die 'BF_ENROLLMENT_ENDPOINT must be a non-placeholder HTTPS URL' ;;
+    esac
+}
+
+validate_token() {
+    local value="$1"
+    [[ -n "$value" ]] || return 1
+    ((${#value} >= 8 && ${#value} <= 4096)) || return 1
+    [[ "$value" != *[[:space:]]* ]] || return 1
+    # [:graph:] is printable without space: no control characters, no blanks.
+    [[ "$value" =~ ^[[:graph:]]+$ ]] || return 1
+}
+
+mode_bits() { stat -c '%a' "$1" 2>/dev/null || printf ''; }
+
+# --- lifecycle state ---------------------------------------------------------
+
+DEALER_ID="$(tr -d '[:space:]' < "$STATE_DIR/dealer-id" 2>/dev/null || true)"
+[[ "$DEALER_ID" =~ ^[0-9]{8}$ ]] || gate_block 'dealer identity is missing or invalid'
+DEVICE_ID="BF-$DEALER_ID"
+
+# read_state emits PHASE=/PROVISIONING_ID=/IDEMPOTENCY_KEY= for a usable state,
+# or ERROR=<reason>. The idempotency key is stable across retries so central can
+# deduplicate, while the one-time token remains single-use.
+read_state() {
+    python3 - "$STATE_FILE" "$DEVICE_ID" "$WG_DIR/publickey" <<'PY'
+import hashlib
+import json
+import sys
+
+path, device, public_key_path = sys.argv[1], sys.argv[2], sys.argv[3]
+VALID_STATES = ('PROVISIONED_OFFLINE', 'ENROLLED', 'READY')
+
+
+def unavailable(reason):
+    print('ERROR=' + reason)
+    raise SystemExit(0)
+
+
+try:
+    with open(path, encoding='utf-8') as handle:
+        state = json.load(handle)
+except OSError:
+    unavailable('state-missing')
+except ValueError:
+    unavailable('state-invalid')
+if not isinstance(state, dict):
+    unavailable('state-invalid')
+if state.get('phase') not in VALID_STATES:
+    unavailable('state-invalid')
+if state.get('device_id') not in (None, device):
+    unavailable('identity-mismatch')
+provisioning_id = state.get('provisioning_id')
+if not isinstance(provisioning_id, str) or not provisioning_id or len(provisioning_id) > 128 \
+        or any(character.isspace() for character in provisioning_id):
+    unavailable('state-invalid')
+try:
+    with open(public_key_path, encoding='utf-8') as handle:
+        public_key = handle.read().strip()
+except OSError:
+    unavailable('public-key-missing')
+if not public_key:
+    unavailable('public-key-missing')
+idempotency_key = hashlib.sha256((provisioning_id + '|' + device + '|' + public_key).encode()).hexdigest()
+print('PHASE=' + state['phase'])
+print('PROVISIONING_ID=' + provisioning_id)
+print('IDEMPOTENCY_KEY=' + idempotency_key)
+PY
+}
+
+STATE_OUT="$(read_state)"
+PHASE=''
+PROVISIONING_ID=''
+IDEMPOTENCY=''
+while IFS= read -r line; do
+    case "$line" in
+        ERROR=state-missing) gate_block 'device has no lifecycle state yet; offline provisioning must complete first' ;;
+        ERROR=identity-mismatch) gate_block 'lifecycle state belongs to another device (device_id mismatch)' ;;
+        ERROR=public-key-missing) gate_block 'WireGuard public key is missing; run local provisioning first' ;;
+        ERROR=*) gate_block 'lifecycle state is unreadable or violates the state contract' ;;
+        PHASE=*) PHASE="${line#PHASE=}" ;;
+        PROVISIONING_ID=*) PROVISIONING_ID="${line#PROVISIONING_ID=}" ;;
+        IDEMPOTENCY_KEY=*) IDEMPOTENCY="${line#IDEMPOTENCY_KEY=}" ;;
+    esac
+done <<<"$STATE_OUT"
+[[ -n "$PHASE" && -n "$PROVISIONING_ID" && -n "$IDEMPOTENCY" ]] || gate_block 'lifecycle state is incomplete'
+
+# Forward-only transition gate: no skipping, no backwards moves.
+case "$PHASE" in
+    PROVISIONED_OFFLINE) ;;
+    ENROLLED)
+        [[ "$REENROLL" -eq 1 ]] || gate_block 'device is already ENROLLED: refusing to replay an enrollment. Pass --reenroll with a fresh one-time token to re-apply.'
+        note 're-applying enrollment on an ENROLLED device (--reenroll); the phase never moves backwards'
+        ;;
+    READY)
+        gate_block 'device is READY: lifecycle transitions never move backwards. Re-provision from the offline media to enroll again.'
+        ;;
+    *) gate_block "enrollment is not allowed from lifecycle phase $PHASE" ;;
+esac
+
+[[ -s "$WG_DIR/privatekey" && -s "$WG_DIR/publickey" ]] || gate_block 'WireGuard key material is missing; run local provisioning first'
+if [[ -n "$(mode_bits "$WG_DIR/privatekey")" ]] && ((8#$(mode_bits "$WG_DIR/privatekey") & 8#077)); then
+    gate_block "WireGuard private key mode is $(mode_bits "$WG_DIR/privatekey"); it must be root-only (0600)"
+fi
+WG_PUBLIC_KEY="$(tr -d '[:space:]' < "$WG_DIR/publickey")"
+
+# --- token sources -----------------------------------------------------------
+
+# staged_token_problem reports why a staged token cannot be used. It never
+# mutates anything, so --check can call it safely.
+staged_token_problem() {
+    if [[ ! -e "$TOKEN_FILE" ]]; then
+        printf 'no staged one-time token (%s)\n' "$TOKEN_FILE"
+        return 0
+    fi
+    [[ -f "$TOKEN_FILE" && ! -L "$TOKEN_FILE" ]] && return 1
+    printf 'staged token path is not a regular file\n'
+    return 0
+}
+
+read_staged_token() {
+    if [[ ! -e "$TOKEN_FILE" ]]; then
+        printf 'bf-enroll: PENDING: no staged one-time token; the device waits for a technician (bf-enroll-now) or --stage\n' >&2
+        exit 0
+    fi
+    [[ -f "$TOKEN_FILE" && ! -L "$TOKEN_FILE" ]] || gate_block 'staged token path is not a regular file; refusing to read it'
+    local owner mode size now mtime
+    owner="$(stat -c '%u' "$TOKEN_FILE")"
+    [[ "$owner" == "$(id -u)" ]] || gate_block "staged token must be owned by uid $(id -u); refusing to read it"
+    mode="$(mode_bits "$TOKEN_FILE")"
+    if ((8#$mode & 8#077)); then
+        gate_block "staged token mode is $mode; it must be root-only (0600)"
+    fi
+    size="$(stat -c '%s' "$TOKEN_FILE")"
+    if ((size == 0 || size > 4100)); then
+        rm -f "$TOKEN_FILE"
+        gate_block 'staged token file size is invalid; the token was discarded'
+    fi
+    now="$(date +%s)"
+    mtime="$(stat -c '%Y' "$TOKEN_FILE")"
+    if ((now - mtime > TOKEN_MAX_AGE)); then
+        rm -f "$TOKEN_FILE"
+        printf 'bf-enroll: PENDING: staged one-time token expired after %ss and was discarded; stage a fresh token\n' "$TOKEN_MAX_AGE" >&2
+        exit 0
+    fi
+    TOKEN="$(head -n 1 "$TOKEN_FILE" | tr -d '\r\n')"
+    if ! validate_token "$TOKEN"; then
+        rm -f "$TOKEN_FILE"
+        gate_block 'staged token is malformed; it was discarded'
+    fi
+}
+
+drop_staged_token() {
+    [[ "$MODE" == 'systemd' ]] || return 0
+    rm -f "$TOKEN_FILE"
+}
+
+stage_token() {
+    [[ -n "$TOKEN" ]] || die 'a non-empty enrollment token is required on stdin'
+    install -d -m 700 "$STATE_DIR"
+    local temp
+    temp="$(mktemp "$STATE_DIR/.enrollment.token.XXXXXX")"
+    chmod 600 "$temp"
+    printf '%s\n' "$TOKEN" > "$temp"
+    unset TOKEN
+    mv -f "$temp" "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+    note "one-time token staged for the boot timer (mode 0600, TTL ${TOKEN_MAX_AGE}s): $TOKEN_FILE"
+}
+
+if [[ "$STAGE" -eq 1 ]]; then
+    if [[ "$CHECK_MODE" -eq 1 ]]; then
+        note "check: would stage a one-time token for the boot timer at $TOKEN_FILE (stdin is not consumed in --check mode)"
+        exit 0
+    fi
+    IFS= read -r TOKEN || true
+    validate_token "$TOKEN" || die 'a printable enrollment token of 8-4096 characters without whitespace is required on stdin'
+    stage_token
+    note 'staged; the boot attempt enrolls as soon as central is reachable'
+    exit 0
+fi
+
+if [[ "$MODE" == 'stdin' ]]; then
+    validate_endpoint
+    if [[ "$CHECK_MODE" -eq 0 ]]; then
+        IFS= read -r TOKEN || true
+        validate_token "$TOKEN" || die 'a printable enrollment token of 8-4096 characters without whitespace is required on stdin'
+    fi
+else
+    if [[ -z "$ENDPOINT" ]]; then
+        # A device without central configuration is not a failure: it stays
+        # PENDING and must not spin in a retry loop.
+        printf 'bf-enroll: PENDING: BF_ENROLLMENT_ENDPOINT is not configured; the boot attempt has nothing to do\n' >&2
+        exit 0
+    fi
+    validate_endpoint
+    if [[ "$CHECK_MODE" -eq 1 ]]; then
+        if problem="$(staged_token_problem)"; then
+            note "check: $problem; the boot attempt would stay PENDING and exit 0"
+            exit 0
+        fi
+    else
+        read_staged_token
+    fi
+fi
+
+if [[ "$CHECK_MODE" -eq 1 ]]; then
+    note "check: would enroll $DEVICE_ID ($PHASE -> ENROLLED) against $ENDPOINT; no request sent, nothing written"
+    note 'check: the WireGuard private key stays local; only the public key and non-secret facts are sent'
+    exit 0
+fi
+
+# --- request -----------------------------------------------------------------
+
+REQUEST_FILE="$(mktemp)"; RESPONSE_FILE="$(mktemp)"; CV_FILE="$(mktemp)"
+chmod 600 "$REQUEST_FILE" "$RESPONSE_FILE" "$CV_FILE"
+python3 - "$REQUEST_FILE" "$DEVICE_ID" "$WG_PUBLIC_KEY" "$IDEMPOTENCY" <<'PY'
+import json
+import platform
+import sys
+
+
+def read_if_readable(path):
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return handle.read().strip()
+    except OSError:
+        return ''
+
+
+# Only the public key and non-secret device facts are sent. The WireGuard
+# private key, the token and any credential are deliberately absent.
+request = {
+    'device_id': sys.argv[2],
+    'wireguard_public_key': sys.argv[3],
+    'idempotency_key': sys.argv[4],
+    'hardware': {
+        'machine_id': read_if_readable('/etc/machine-id'),
+        'product_uuid': read_if_readable('/sys/class/dmi/id/product_uuid'),
+        'sys_vendor': read_if_readable('/sys/class/dmi/id/sys_vendor'),
+    },
+    'release': {
+        'os_release': read_if_readable('/etc/os-release'),
+        'kernel': platform.release(),
+    },
+}
+with open(sys.argv[1], 'w', encoding='utf-8') as handle:
+    json.dump(request, handle, separators=(',', ':'))
+PY
+
+# The Authorization header arrives through an anonymous process-substitution fd:
+# the one-time token is never on argv, on disk, in the state file or in a log.
+# --proto/--max-redirs pin the transport: HTTPS only, no redirect can move the
+# token to another origin.
+if HTTP_CODE="$(curl --proto '=https' --tlsv1.2 --max-redirs 0 \
+    --request POST --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" \
+    --silent --show-error --fail --write-out '%{http_code}' \
+    -H 'Content-Type: application/json' \
+    -H @<(printf 'Authorization: Bearer %s' "$TOKEN") \
+    --data-binary "@$REQUEST_FILE" --output "$RESPONSE_FILE" "$ENDPOINT")"; then
+    CURL_RC=0
+else
+    CURL_RC=$?
+fi
+unset TOKEN
+if [[ "$CURL_RC" -ne 0 ]]; then
+    case "$HTTP_CODE" in
+        4??)
+            drop_staged_token
+            die "central rejected the enrollment request (HTTP $HTTP_CODE, curl exit $CURL_RC); that one-time token is consumed, obtain a fresh token"
+            ;;
+        *)
+            die "enrollment request did not complete (curl exit $CURL_RC, HTTP ${HTTP_CODE:-000}); lifecycle stays at its prior state and any staged token is kept for the bounded retry"
+            ;;
+    esac
+fi
+
+# --- response validation and local configuration -----------------------------
+
+STAGED_CONFIG="$(mktemp "$WG_DIR/.wg0.conf.XXXXXX")"
+chmod 600 "$STAGED_CONFIG"
+python3 - "$RESPONSE_FILE" "$STAGED_CONFIG" "$CV_FILE" "$DEVICE_ID" "$WG_PUBLIC_KEY" "$IDEMPOTENCY" "$WG_DIR" <<'PY'
+import json
+import os
+import re
+import sys
+
+response_path, config_path, cv_path, device, public_key, idempotency, wg_dir = sys.argv[1:8]
+
+
+def bad(message):
+    sys.stderr.write('Enrollment response invalid: ' + message + '\n')
+    raise SystemExit(1)
+
+
+try:
+    with open(response_path, encoding='utf-8') as handle:
+        response = json.load(handle)
+except ValueError:
+    bad('not valid JSON')
+allowed = {'status', 'device_id', 'idempotency_key', 'enrollment_id', 'wireguard', 'central_verification'}
+required = {'status', 'device_id', 'idempotency_key', 'wireguard', 'central_verification'}
+if not isinstance(response, dict) or set(response) - allowed:
+    bad('unexpected top-level field (no private key or extra secret is accepted)')
+if not required <= set(response):
+    bad('required field missing')
+if response['status'] != 'accepted' or response['device_id'] != device or response['idempotency_key'] != idempotency:
+    bad('status or identity mismatch')
+if 'enrollment_id' in response and not isinstance(response['enrollment_id'], str):
+    bad('enrollment_id type')
+wireguard = response['wireguard']
+if not isinstance(wireguard, dict) or set(wireguard) != {'address', 'endpoint', 'server_public_key', 'allowed_ips'}:
+    bad('WireGuard fields')
+server_public_key = wireguard['server_public_key']
+endpoint = wireguard['endpoint']
+address = wireguard['address']
+allowed_ips = wireguard['allowed_ips']
+if not all(isinstance(value, str) for value in (server_public_key, endpoint, address, allowed_ips)):
+    bad('WireGuard types')
+if not re.fullmatch(r'[A-Za-z0-9+/]{43}=', server_public_key):
+    bad('server public key')
+if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]*:[1-9][0-9]{0,4}', endpoint) \
+        or any(marker in endpoint.lower() for marker in ('example', 'invalid', '<', '>')):
+    bad('endpoint')
+if int(endpoint.rsplit(':', 1)[1]) > 65535:
+    bad('endpoint port')
+if not re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}/(?:[0-9]|[12][0-9]|3[0-2])', address):
+    bad('address')
+if not allowed_ips or '\n' in allowed_ips or '\r' in allowed_ips:
+    bad('allowed_ips')
+central = response['central_verification']
+if not isinstance(central, dict) or set(central) != {'status', 'verification_id', 'monitoring', 'remote', 'management'}:
+    bad('central verification fields')
+if central['status'] not in ('pending', 'verified') or not isinstance(central['verification_id'], str) or not central['verification_id']:
+    bad('central verification status')
+for name in ('monitoring', 'remote', 'management'):
+    item = central[name]
+    if not isinstance(item, dict) or set(item) != {'status', 'verification_id'} \
+            or item['status'] not in ('pending', 'verified') \
+            or not isinstance(item['verification_id'], str) or not item['verification_id']:
+        bad('central ' + name + ' evidence')
+
+# The device keeps its own private key: it is never accepted from central, never
+# sent, and never stored outside /etc/wireguard.
+try:
+    with open(os.path.join(wg_dir, 'privatekey'), encoding='utf-8') as handle:
+        private_key = handle.read().strip()
+except OSError:
+    private_key = ''
+if not private_key:
+    bad('local WireGuard private key is unreadable')
+
+config = (
+    '[Interface]\n'
+    'PrivateKey = ' + private_key + '\n'
+    'Address = ' + address + '\n'
+    '\n'
+    '[Peer]\n'
+    'PublicKey = ' + server_public_key + '\n'
+    'Endpoint = ' + endpoint + '\n'
+    'AllowedIPs = ' + allowed_ips + '\n'
+    'PersistentKeepalive = 25\n'
+)
+descriptor = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+    handle.write(config)
+with open(cv_path, 'w', encoding='utf-8') as handle:
+    json.dump({'central_verification': central}, handle, separators=(',', ':'))
+PY
+chmod 600 "$STAGED_CONFIG"
+
+# --- activation with rollback ------------------------------------------------
+
+rollback_activation() {
+    if [[ -n "$BACKUP_CONFIG" && -e "$BACKUP_CONFIG" ]]; then
+        mv -f "$BACKUP_CONFIG" "$WG_DIR/wg0.conf"
+        BACKUP_CONFIG=''
+        chmod 600 "$WG_DIR/wg0.conf" 2>/dev/null || true
+        systemctl restart wg-quick@wg0 >/dev/null 2>&1 || true
+    else
+        rm -f "$WG_DIR/wg0.conf"
+        systemctl disable --now wg-quick@wg0 >/dev/null 2>&1 || true
+    fi
+}
+
+if [[ -e "$WG_DIR/wg0.conf" ]]; then
+    BACKUP_CONFIG="$(mktemp "$WG_DIR/.wg0.conf.backup.XXXXXX")"
+    cp -p "$WG_DIR/wg0.conf" "$BACKUP_CONFIG"
+fi
+mv "$STAGED_CONFIG" "$WG_DIR/wg0.conf"
+STAGED_CONFIG=''
+chmod 600 "$WG_DIR/wg0.conf"
+if ! systemctl enable wg-quick@wg0 || ! systemctl restart wg-quick@wg0 \
+        || ! systemctl is-enabled --quiet wg-quick@wg0 || ! systemctl is-active --quiet wg-quick@wg0 \
+        || ! ip link show wg0 >/dev/null 2>&1; then
+    rollback_activation
+    die 'WireGuard configuration could not be activated; lifecycle remains at its prior state (configuration rolled back)'
+fi
+
+# --- atomic state commit -----------------------------------------------------
+
+python3 - "$STATE_FILE" "$DEVICE_ID" "$IDEMPOTENCY" "$CV_FILE" "$RESPONSE_FILE" "$REENROLL" <<'PY'
+import datetime
+import fcntl
+import json
+import os
+import sys
+import tempfile
+
+state_path, device, idempotency, cv_path, response_path, reenroll = sys.argv[1:7]
+directory = os.path.dirname(state_path) or '.'
+with open(cv_path, encoding='utf-8') as handle:
+    central = json.load(handle)['central_verification']
+with open(response_path, encoding='utf-8') as handle:
+    enrollment_id = json.load(handle).get('enrollment_id') or 'accepted'
+
+# Serialize lifecycle writers (boot timer vs. technician) and re-check the
+# transition under the lock so a stale decision can never be committed.
+lock = os.open(os.path.join(directory, '.state.lock'), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    raise SystemExit('bf-enroll: another lifecycle update is in progress; nothing was committed')
+
+with open(state_path, encoding='utf-8') as handle:
+    state = json.load(handle)
+current = state.get('phase')
+if current == 'READY':
+    raise SystemExit('bf-enroll: refusing to move a READY device backwards; nothing was committed')
+if current not in ('PROVISIONED_OFFLINE', 'ENROLLED'):
+    raise SystemExit('bf-enroll: device is not PROVISIONED_OFFLINE; nothing was committed')
+if current == 'ENROLLED' and reenroll != '1':
+    raise SystemExit('bf-enroll: device is already ENROLLED; refusing a replay')
+if state.get('device_id') not in (None, device):
+    raise SystemExit('bf-enroll: lifecycle state device_id mismatch; nothing was committed')
+
+# Forward-only transition, exactly one stage: PROVISIONED_OFFLINE -> ENROLLED.
+state.update({
+    'phase': 'ENROLLED',
+    'enrollment_status': 'ENROLLED',
+    'fleet_status': 'PENDING',
+    'device_id': device,
+    'enrollment_id': enrollment_id,
+    'idempotency_key': idempotency,
+    'central_verification': central,
+    'enrolled_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+})
+descriptor, temporary = tempfile.mkstemp(prefix='.state.json.', dir=directory)
+try:
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+        json.dump(state, handle, sort_keys=True)
+        handle.write('\n')
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, state_path)
+except BaseException:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+    raise
+os.chmod(state_path, 0o600)
+PY
+
+drop_staged_token
+rm -f "$BACKUP_CONFIG"
+BACKUP_CONFIG=''
+note 'Enrollment accepted and WireGuard is active. Device is ENROLLED; READY requires fresh local checks and central verification evidence.'

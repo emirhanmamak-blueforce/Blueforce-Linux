@@ -76,7 +76,7 @@ Saha cihazları NAT/CGNAT arkasındadır; merkez onlara ulaşamaz, onlar merkeze
 1. Merkez hub kurulur, subnet planı dondurulur (ör. `10.8.0.0/16`, hub `10.8.0.1`, cihazlara sabit `/32`).
 2. Her cihaz için peer üretilir: adı `bf-<8hane>`, tünel IP'si envanter haritasından.
 3. İstemci config'i (`/etc/wireguard/wg0.conf`): hub endpoint + `PersistentKeepalive = 25` + `wg-quick@wg0 enable`.
-4. Peer ekleme/çıkarma Ansible rolüyle yapılır (09); hub config'i Git'te sürümlenir.
+4. Peer ekleme/çıkarma yalnız 29-ENROLLMENT sonrasında Ansible rolüyle yapılır (09); hub config'i Git'te sürümlenir. `PROVISIONED_OFFLINE` cihaz peer/handshake doğrulanmadan `READY` olamaz.
 5. PİLOT-1'de kopma sayacı koşar (handshake yaşı metriği 14'te), keepalive saha verisiyle ayarlanır.
 
 ```bash

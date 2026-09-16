@@ -1,0 +1,35 @@
+---
+# Restart a single service by name (parametric, allowlisted).
+# Run: ansible-playbook -i inventory/hosts.yml playbooks/bf-service-restart.yml --limit lab -e service_name=blueforce-agent
+# Only names in service_allowlist are accepted; everything else fails closed.
+# No Semaphore Pro feature is used.
+- name: Restart allowlisted service
+  hosts: blueforce
+  gather_facts: false
+  become: true
+  vars:
+    service_name: ""
+    service_allowlist:
+      - blueforce-agent
+      - docker
+      - sshd
+      - ssh
+      - systemd-journald
+      - cron
+  tasks:
+    - name: Validate service_name is provided
+      ansible.builtin.assert:
+        that:
+          - service_name | length > 0
+        fail_msg: "service_name is required, e.g. -e service_name=blueforce-agent"
+
+    - name: Validate service_name is allowlisted
+      ansible.builtin.assert:
+        that:
+          - service_name in service_allowlist
+        fail_msg: "service_name '{{ service_name }}' is not in the allowlist. Refusing to restart arbitrary services."
+
+    - name: Restart service
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: restarted

@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+#
+# bf-check-ready - READY level gate.
+#
+# READY proof is always re-derived from current independent checks; a persisted
+# READY value is never trusted and never used as evidence. All of the following
+# must pass in this order:
+#   1. bf-check-local      - local provisioning and access services,
+#   2. bf-check-enrollment - ENROLLED stage: state contract, central
+#                            verification record, assigned WireGuard peer,
+#                            live tunnel and a fresh handshake,
+#   3. bf-remote-status --check - xRDP, RustDesk, optional Mesh and every
+#                            central channel (monitoring, remote, management)
+#                            marked verified.
+#
+# Without evidence from every central channel this gate fails closed: a device
+# with WireGuard only stays ENROLLED, it never becomes READY.
+#
+# Usage: bf-check-ready [--check] [--help]
+# Exit status: 0 READY proof complete, 1 at least one gate failed.
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+    cat <<'EOF'
+Usage: bf-check-ready [--check]
+
+Re-derive the READY proof: local gates, ENROLLED gates and complete central
+channel verification (bf-remote-status --check). Nothing is written.
+
+Exit status: 0 READY proof complete, 1 otherwise.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check) shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+"$SELF_DIR/bf-check-local" || { printf 'bf-check-ready: FAILED at local gates (device stays PROVISIONED_OFFLINE)\n'; exit 1; }
+"$SELF_DIR/bf-check-enrollment" || { printf 'bf-check-ready: FAILED at enrollment gates (device stays ENROLLED)\n'; exit 1; }
+"$SELF_DIR/bf-remote-status" --check || { printf 'bf-check-ready: FAILED at channel verification (device stays ENROLLED)\n'; exit 1; }
+
+printf 'bf-check-ready: READY proof complete (local health plus every central channel verified)\n'

@@ -1,0 +1,16 @@
+---
+# Collect uptime from fleet hosts (read-only).
+# Run: ansible-playbook -i inventory/hosts.yml playbooks/bf-uptime.yml --limit pilot_1
+# No changes are made by this playbook. No Semaphore Pro feature is used.
+- name: Report host uptime
+  hosts: blueforce
+  gather_facts: false
+  tasks:
+    - name: Get uptime
+      ansible.builtin.command: uptime
+      register: uptime_out
+      changed_when: false
+
+    - name: Show uptime
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ uptime_out.stdout }}"

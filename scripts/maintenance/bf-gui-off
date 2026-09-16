@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+#
+# bf-gui-off - Switch the field terminal back to console (multi-user) mode.
+#
+# Stops only the local display manager, preserves xRDP remote access, and isolates
+# multi-user.target. Idempotent: already-console systems are left untouched.
+#
+# Install: install -m 0755 bf-gui-off /usr/local/bin/bf-gui-off
+# Usage: sudo bf-gui-off
+#
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: bf-gui-off [--help]
+
+Stop the graphical layer and return the device to console mode.
+
+Options:
+  --help   Show this help and exit
+
+Behavior:
+  - Stops only the local display manager (gdm3/gdm/...); xRDP and xrdp-sesman are preserved
+  - Disables the local display manager so it does not restart on boot
+  - Runs 'systemctl isolate multi-user.target'
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "ERROR: bf-gui-off must run as root (use sudo)." >&2
+    exit 1
+fi
+
+log() { echo "[bf-gui-off] $*"; }
+
+# Only the local physical display manager is controlled here. xRDP stays enabled
+# and active so remote recovery is available while the console is local-default.
+UNITS=(gdm3 gdm sddm lightdm)
+
+for unit in "${UNITS[@]}"; do
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${unit}"; then
+        if systemctl is-active --quiet "${unit}"; then
+            log "Stopping ${unit} ..."
+            systemctl stop "${unit}" || log "WARNING: failed to stop ${unit}."
+        else
+            log "${unit} already stopped."
+        fi
+        systemctl disable "${unit}" >/dev/null 2>&1 || true
+    fi
+done
+
+log "Isolating multi-user.target ..."
+systemctl isolate multi-user.target
+
+log "GUI is OFF (console mode)."

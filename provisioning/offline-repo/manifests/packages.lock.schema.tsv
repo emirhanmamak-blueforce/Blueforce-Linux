@@ -1,0 +1,29 @@
+# Blueforce Field OS - SBOM / package lock schema for the offline APT bundle
+#
+# build-offline-repo.sh writes this layout into a built bundle as:
+#     <output>/packages.lock.tsv
+# scripts/install/blueforce-install.sh validates that file before any package
+# module runs: it must exist, be non-empty, carry the header on the FIRST line
+# byte for byte, and every row must hold a package, a version, an architecture,
+# a 64-character lower-case sha256, and the pool file name of the .deb.
+#
+# Columns (TAB-separated, exactly five, header first):
+#   package        lower-case Debian package name      ^[a-z0-9][a-z0-9+.-]*$
+#   version        exact Debian version, epochs allowed
+#   architecture   binary architecture                e.g. amd64, all
+#   sha256         sha256sum of the .deb, 64 lower-case hex characters
+#   source         file name of the .deb inside <output>/pool/
+#
+# LAB fill procedure:
+#   1. review the .deb files and place them in one local pool directory
+#   2. fill every UNPINNED version in manifests/*.txt from those .deb files
+#   3. ./build-offline-repo.sh --packages /secure/reviewed-debs --output /srv/blueforce-apt
+#   4. the released packages.lock.tsv is the build output; never hand-edit a
+#      released lock, and never hand-write a sha256 - the build recomputes it
+#
+# This template is documentation, not a bundle artifact: the header sits below the
+# comments so the file can never be mistaken for a released packages.lock.tsv.
+#
+# ==== EXAMPLE ROWS - format illustration only, never a released artifact ====
+# <package>	<exact version>	<amd64 or all>	<64 hex characters>	<package>_<version>_<arch>.deb
+package	version	architecture	sha256	source

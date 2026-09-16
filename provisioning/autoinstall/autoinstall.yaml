@@ -1,0 +1,28 @@
+# Ubuntu Subiquity autoinstall v1 for the Blueforce Field OS installation medium.
+#
+# This file is copied to the root of the installation medium as /autoinstall.yaml,
+# which is where Subiquity looks for configuration on the medium itself. No separate
+# NoCloud seed USB is needed, and the same content is shipped under
+# /blueforce-provisioning/autoinstall/ for the seed-based V1 flow.
+#
+# Storage stays interactive on purpose: the operator selects and confirms the target
+# disk on the installer screen. This file contains no layout, match, wipe, path or
+# identity directive, and device identity is collected at firstboot.
+autoinstall:
+  version: 1
+  interactive-sections: [storage]
+  # No primary mirror is reachable at an air-gapped site: install from the medium.
+  apt:
+    fallback: offline-install
+  late-commands:
+    # Medium contents: /autoinstall.yaml plus /blueforce-provisioning/{autoinstall,
+    # firstboot,offline-repo,release}. These commands only copy reviewed medium
+    # content into the target; no device identity is created or embedded here.
+    - mkdir -p /target/opt/blueforce
+    - cp -a /cdrom/blueforce-provisioning/offline-repo /target/opt/blueforce/offline-repo
+    - "curtin in-target -- sh -c 'cp -a /opt/blueforce/offline-repo/built/. /opt/blueforce/offline-repo/ 2>/dev/null || true'"
+    - "curtin in-target -- sh -c 'rmdir /opt/blueforce/offline-repo/built 2>/dev/null || true'"
+    - install -D -m 0755 /cdrom/blueforce-provisioning/firstboot/bf-firstboot /target/usr/local/sbin/bf-firstboot
+    - install -D -m 0644 /cdrom/blueforce-provisioning/firstboot/blueforce-firstboot.service /target/etc/systemd/system/blueforce-firstboot.service
+    - install -D -m 0644 /cdrom/blueforce-provisioning/release/blueforce-release /target/etc/blueforce-release
+    - curtin in-target -- systemctl enable blueforce-firstboot.service

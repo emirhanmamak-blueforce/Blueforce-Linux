@@ -1,0 +1,208 @@
+---
+# Blueforce Field OS sürüm raporu -- READ-ONLY, dalga kapsamlı.
+# Ne yapar: bir dalgadaki cihazların Field OS sürümünü kanıt dosyalarından toplar, cihaz başına
+#           tek satır yazar ve sürüm başına cihaz sayısını (toplu özet) üretir.
+# Kanıt sırası: /usr/local/bin/bf-release (kanonik) -> /etc/blueforce/release-manifest.yaml
+#               -> eski /etc/blueforce-release (KEY=VALUE) -> /var/lib/blueforce/state.json.
+# Hiçbir görev durum değiştirmez: yalnız stat/slurp ve read-only CLI çıktısı okunur; tüm
+# command görevleri changed_when: false taşır.
+# Kuru koşu: ansible-playbook -i inventory/hosts.yml playbooks/bf-fieldos-version.yml -e operation_wave=lab -e operation_confirmed=true --check
+# Koşu:      ansible-playbook -i inventory/hosts.yml playbooks/bf-fieldos-version.yml -e operation_wave=lab -e operation_confirmed=true
+# Opsiyonel drift denetimi: -e fieldos_expected_version=1.0.0
+# Semaphore Pro bağımlılığı yok.
+# Dalga kapısı: operation_wave + operation_confirmed (+ production_override) rapor play'inden ÖNCE,
+# hiçbir hosta dokunmadan doğrulanır; --limit dalga ile kesişmezse koşu reddedilir (fail-closed).
+- name: Dalga ve onay kapısı -- hiçbir hosta dokunmadan önce (mutasyon yok)
+  hosts: "{{ ansible_limit | default('localhost') }}"
+  gather_facts: false
+  become: false
+  vars:
+    approved_operation_waves: [lab, pilot_1, pilot_2, wave_1, wave_2, production]
+    production_override: false
+    operation_wave_gate: "{{ operation_wave | default('invalid-wave', true) }}"
+  tasks:
+    - name: Require an approved confirmed operation wave before any host is touched
+      ansible.builtin.assert:
+        that:
+          - operation_wave_gate in approved_operation_waves
+          - operation_confirmed | default(false) | bool
+          - operation_wave_gate in groups
+          - groups[operation_wave_gate] | length > 0
+          - (operation_wave_gate != 'production') or (production_override | default(false) | bool)
+        fail_msg: "operation_wave must name a non-empty approved inventory group (lab/pilot_1/pilot_2/wave_1/wave_2/production), operation_confirmed=true is required, and production additionally requires production_override=true."
+      run_once: true
+
+    - name: Require the --limit selection to intersect the declared wave
+      ansible.builtin.assert:
+        that:
+          - (((ansible_limit | default('') | split(',') | intersect(groups[operation_wave_gate]) | length) > 0)
+            or ((ansible_limit | default('') | split(',') | select('in', groups) | map('extract', groups) | flatten | unique | intersect(groups[operation_wave_gate]) | length) > 0))
+        fail_msg: "--limit selection '{{ ansible_limit }}' does not intersect the '{{ operation_wave_gate }}' wave; refusing a mis-scoped run."
+      when:
+        - (ansible_limit | default('') | length) > 0
+        - not (ansible_limit | default('') is search('[][*?]'))
+      run_once: true
+
+- name: Field OS sürümünü toplu raporla (read-only)
+  hosts: "{{ operation_wave | default('invalid-wave', true) }}"
+  gather_facts: false
+  become: true  # Yalnız root sahipli kanıt dosyalarını (state.json 0600) OKUMAK için; mutasyon yok.
+  vars:
+    approved_operation_waves: [lab, pilot_1, pilot_2, wave_1, wave_2, production]
+    production_override: false
+    fieldos_release_bin: /usr/local/bin/bf-release
+    fieldos_manifest_file: /etc/blueforce/release-manifest.yaml
+    fieldos_legacy_file: /etc/blueforce-release
+    fieldos_state_file: /var/lib/blueforce/state.json
+    fieldos_expected_version: ""
+    fieldos_unknown_label: UNKNOWN
+  pre_tasks:
+    - name: Require confirmed approved operation wave scope
+      ansible.builtin.assert:
+        that:
+          - operation_wave in approved_operation_waves
+          - operation_confirmed | bool
+          - operation_wave in groups
+          - groups[operation_wave] | length > 0
+          - ansible_play_hosts_all | length > 0
+          - ansible_play_hosts_all | difference(groups[operation_wave]) | length == 0
+        fail_msg: "Set operation_wave to one inventory wave and operation_confirmed=true; full-fleet scope is refused."
+      run_once: true
+
+    - name: Require separate production override
+      ansible.builtin.assert:
+        that:
+          - operation_wave != 'production' or production_override | bool
+        fail_msg: "Production operation requires production_override=true in addition to operation_confirmed=true."
+      run_once: true
+  tasks:
+    - name: Kanıt yollarının varlığını denetle (read-only)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ fieldos_release_bin }}"
+        - "{{ fieldos_manifest_file }}"
+        - "{{ fieldos_legacy_file }}"
+        - "{{ fieldos_state_file }}"
+      register: fieldos_evidence
+
+    - name: Kanıt durumlarını yol ile indeksle
+      ansible.builtin.set_fact:
+        fieldos_evidence_by_path: "{{ fieldos_evidence.results | items2dict(key_name='item', value_name='stat') }}"
+
+    - name: Kanonik sürüm raporunu oku (bf-release, read-only)
+      ansible.builtin.command: "{{ fieldos_release_bin }}"
+      register: fieldos_release_out
+      changed_when: false
+      failed_when: fieldos_release_out.rc not in [0, 1]
+      when: fieldos_evidence_by_path[fieldos_release_bin].exists | default(false)
+
+    - name: Release manifestini oku (read-only)
+      ansible.builtin.slurp:
+        src: "{{ fieldos_manifest_file }}"
+      register: fieldos_manifest_raw
+      when:
+        - fieldos_evidence_by_path[fieldos_manifest_file].exists | default(false)
+        - fieldos_evidence_by_path[fieldos_manifest_file].size | default(0) | int > 0
+
+    - name: Eski /etc/blueforce-release dosyasını oku (read-only)
+      ansible.builtin.slurp:
+        src: "{{ fieldos_legacy_file }}"
+      register: fieldos_legacy_raw
+      when:
+        - fieldos_evidence_by_path[fieldos_legacy_file].exists | default(false)
+        - fieldos_evidence_by_path[fieldos_legacy_file].size | default(0) | int > 0
+
+    - name: Field OS durum dosyasını oku (read-only)
+      ansible.builtin.slurp:
+        src: "{{ fieldos_state_file }}"
+      register: fieldos_state_raw
+      when:
+        - fieldos_evidence_by_path[fieldos_state_file].exists | default(false)
+        - fieldos_evidence_by_path[fieldos_state_file].size | default(0) | int > 0
+
+    - name: Durum dosyası içeriğini çöz (bozuk dosyada rapor UNKNOWN kalır, koşu durmaz)
+      ansible.builtin.set_fact:
+        fieldos_state_parsed: "{{ fieldos_state_raw.content | b64decode | from_json }}"
+      when: fieldos_state_raw.content is defined
+      ignore_errors: true
+
+    - name: Kanıt metinlerini çözümle
+      ansible.builtin.set_fact:
+        fieldos_manifest_text: "{{ (fieldos_manifest_raw.content | b64decode) if fieldos_manifest_raw.content is defined else '' }}"
+        fieldos_legacy_text: "{{ (fieldos_legacy_raw.content | b64decode) if fieldos_legacy_raw.content is defined else '' }}"
+        fieldos_state_ok: "{{ fieldos_state_parsed is defined and fieldos_state_parsed is mapping }}"
+
+    - name: Sürüm alanlarını kanıtlardan çıkar
+      ansible.builtin.set_fact:
+        fieldos_release_line: "{{ fieldos_release_out.stdout_lines | default([]) | select('search', '^Field OS: ') | list | first | default('', true) }}"
+        fieldos_manifest_name_raw: "{{ fieldos_manifest_text | regex_findall('(?m)^[ ]+name: ([^ ]+)') | first | default('', true) }}"
+        fieldos_manifest_version_raw: "{{ fieldos_manifest_text | regex_findall('(?m)^[ ]+version: ([^ ]+)') | first | default('', true) }}"
+        fieldos_manifest_status_raw: "{{ fieldos_manifest_text | regex_findall('(?m)^[ ]+status: ([^ ]+)') | first | default('', true) }}"
+        fieldos_legacy_version_raw: "{{ fieldos_legacy_text | regex_findall('(?mi)^version=(.+)$') | first | default('', true) }}"
+        fieldos_state_version_raw: "{{ (fieldos_state_parsed | default({}, true)).get('field_os_version', (fieldos_state_parsed | default({}, true)).get('release_version', '')) | default('', true) }}"
+        fieldos_device_id: "{{ (fieldos_state_parsed | default({}, true)).get('device_id', inventory_hostname | upper) }}"
+
+    - name: Sürüm değerlerini normalize et (unknown/boş değer geçersiz sayılır)
+      ansible.builtin.set_fact:
+        fieldos_release_version: "{{ fieldos_release_line | trim | regex_replace('(?i)^unknown$', '') }}"
+        fieldos_manifest_version: "{{ fieldos_manifest_version_raw | trim | regex_replace('(?i)^(unknown|skeleton)$', '') }}"
+        fieldos_legacy_version: "{{ fieldos_legacy_version_raw | trim | regex_replace('(?i)^unknown$', '') }}"
+        fieldos_state_version: "{{ fieldos_state_version_raw | trim | regex_replace('(?i)^unknown$', '') }}"
+
+    - name: Field OS sürümünü ve kanıt kaynağını belirle
+      ansible.builtin.set_fact:
+        fieldos_version: "{{ [fieldos_release_version, fieldos_manifest_version, fieldos_legacy_version, fieldos_state_version] | reject('equalto', '') | list | first | default(fieldos_unknown_label, true) }}"
+        fieldos_version_source: >-
+          {{ 'bf-release' if fieldos_release_version | length > 0
+             else ('release-manifest' if fieldos_manifest_version | length > 0
+             else ('blueforce-release' if fieldos_legacy_version | length > 0
+             else ('state.json' if fieldos_state_version | length > 0 else 'none'))) }}
+        fieldos_release_status: >-
+          {{ 'UNAPPROVED_SKELETON' if fieldos_manifest_status_raw | trim | lower == 'skeleton'
+             else (fieldos_manifest_status_raw | trim | upper if fieldos_manifest_status_raw | trim | length > 0 else 'UNKNOWN') }}
+        fieldos_release_name: "{{ fieldos_manifest_name_raw | trim | default('', true) }}"
+
+    - name: Cihaz sürüm satırını raporla
+      ansible.builtin.debug:
+        msg: "{{ fieldos_device_id }} -> {{ fieldos_version }} (kaynak={{ fieldos_version_source }}, release={{ fieldos_release_status }})"
+
+    - name: Sürümü doğrulanamayan cihazı işaretle
+      ansible.builtin.debug:
+        msg: "UYARI {{ fieldos_device_id }}: Field OS sürüm kanıtı yok (kaynak=none); cihaz inceleme/yeniden provision gerektirir."
+      when: fieldos_version == fieldos_unknown_label
+
+    - name: Onaysız iskelet release taşıyan cihazı işaretle
+      ansible.builtin.debug:
+        msg: "UYARI {{ fieldos_device_id }}: release status UNAPPROVED_SKELETON; saha cihazı olarak kabul edilmez."
+      when: fieldos_release_status == 'UNAPPROVED_SKELETON'
+
+    - name: Beklenen sürümden sapan cihazı işaretle
+      ansible.builtin.debug:
+        msg: "UYARI {{ fieldos_device_id }}: sürüm {{ fieldos_version }}, beklenen {{ fieldos_expected_version }}."
+      when:
+        - fieldos_expected_version | length > 0
+        - fieldos_version != fieldos_expected_version
+
+    - name: Dalga sürüm dağılımını hesapla (sürüm -> cihaz sayısı)
+      ansible.builtin.set_fact:
+        fieldos_version_histogram: "{{ fieldos_version_histogram | default({}) | combine({ item: fieldos_wave_versions | select('equalto', item) | list | length }) }}"
+      loop: "{{ fieldos_wave_versions | unique | sort }}"
+      vars:
+        fieldos_wave_versions: "{{ ansible_play_hosts_all | map('extract', hostvars, 'fieldos_version') | map('default', fieldos_unknown_label, true) | list }}"
+      run_once: true
+
+    - name: Dalga sürüm özetini yaz
+      ansible.builtin.debug:
+        msg:
+          - "Dalga {{ operation_wave }} | raporlanan cihaz: {{ ansible_play_hosts_all | length }}"
+          - "Sürüm dağılımı: {{ fieldos_version_histogram | default({}) }}"
+          - "Beklenen sürüm: {{ fieldos_expected_version if fieldos_expected_version | length > 0 else '(verilmedi, drift denetimi atlandi)' }}"
+      run_once: true
+
+    - name: Sürüm kanıtı olmayan cihazların dalga listesini yaz
+      ansible.builtin.debug:
+        msg: "Sürüm kanıtı olmayan cihazlar: {{ fieldos_missing_version_hosts }}"
+      vars:
+        fieldos_missing_version_hosts: "{{ dict(ansible_play_hosts_all | zip(ansible_play_hosts_all | map('extract', hostvars, 'fieldos_version') | map('default', fieldos_unknown_label, true) | list)) | dict2items | selectattr('value', 'equalto', fieldos_unknown_label) | map(attribute='key') | list }}"
+      run_once: true

@@ -1,0 +1,48 @@
+---
+# WireGuard client setup: package, config from template variables, tunnel up.
+# Private keys are supplied through the Semaphore Community Key Store, never committed.
+# No Semaphore Pro feature is used.
+- name: Validate required WireGuard configuration
+  ansible.builtin.assert:
+    that:
+      - wg_address | length > 0
+      - wg_private_key | length > 0
+      - wg_hub_public_key | length > 0
+      - wg_hub_endpoint | length > 0
+      - wg_allowed_ips | length > 0
+    fail_msg: WireGuard address, keys, hub endpoint, and allowed IPs are required.
+  no_log: true
+
+- name: Ensure WireGuard package is present
+  ansible.builtin.apt:
+    name: wireguard
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Write WireGuard client config
+  ansible.builtin.copy:
+    dest: "/etc/wireguard/{{ wg_interface }}.conf"
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      [Interface]
+      PrivateKey = {{ wg_private_key }}
+      Address = {{ wg_address }}
+      {% if wg_dns | default('') | length > 0 %}
+      DNS = {{ wg_dns }}
+      {% endif %}
+      [Peer]
+      PublicKey = {{ wg_hub_public_key }}
+      Endpoint = {{ wg_hub_endpoint }}
+      AllowedIPs = {{ wg_allowed_ips }}
+      PersistentKeepalive = {{ wg_keepalive }}
+  no_log: true
+  notify: Restart WireGuard
+
+- name: Enable and start WireGuard tunnel
+  ansible.builtin.systemd:
+    name: "wg-quick@{{ wg_interface }}"
+    enabled: true
+    state: started

@@ -1,0 +1,20 @@
+#cloud-config
+# NoCloud payload for the V1 "official ISO + seed USB" flow. The autoinstall block is
+# kept identical to provisioning/autoinstall/autoinstall.yaml: the custom Field OS
+# medium carries the same configuration at /autoinstall.yaml, so both flows behave the
+# same way and storage always stays operator-confirmed.
+autoinstall:
+  version: 1
+  interactive-sections: [storage]
+  # No primary mirror is reachable at an air-gapped site: install from the medium.
+  apt:
+    fallback: offline-install
+  late-commands:
+    - mkdir -p /target/opt/blueforce
+    - cp -a /cdrom/blueforce-provisioning/offline-repo /target/opt/blueforce/offline-repo
+    - "curtin in-target -- sh -c 'cp -a /opt/blueforce/offline-repo/built/. /opt/blueforce/offline-repo/ 2>/dev/null || true'"
+    - "curtin in-target -- sh -c 'rmdir /opt/blueforce/offline-repo/built 2>/dev/null || true'"
+    - install -D -m 0755 /cdrom/blueforce-provisioning/firstboot/bf-firstboot /target/usr/local/sbin/bf-firstboot
+    - install -D -m 0644 /cdrom/blueforce-provisioning/firstboot/blueforce-firstboot.service /target/etc/systemd/system/blueforce-firstboot.service
+    - install -D -m 0644 /cdrom/blueforce-provisioning/release/blueforce-release /target/etc/blueforce-release
+    - curtin in-target -- systemctl enable blueforce-firstboot.service

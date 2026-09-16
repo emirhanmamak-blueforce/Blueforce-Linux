@@ -1,0 +1,36 @@
+# RustDesk self-hosted server (hbbs + hbbr) on the central VDS.
+# OSS edition (AGPL-3.0), unlimited clients, no license cost.
+# Docs: https://rustdesk.com/docs/en/self-host/rustdesk-server-oss/
+#
+# Port contract (VDS firewall must allow these from field-device internet):
+#   21115/TCP  hbbs  NAT-type test
+#   21116/TCP  hbbs  ID registration / heartbeat
+#   21116/UDP  hbbs  TCP hole punching
+#   21117/TCP  hbbr  relay traffic
+# Optional, keep CLOSED unless the web client is used:
+#   21118/TCP  hbbs  web client support
+#   21119/TCP  hbbr  web client support
+# Pro-only (not used here):
+#   21114/TCP  Pro web console
+#
+# network_mode: host is REQUIRED so hbbs/hbbr see the real client source
+# IPs (rendezvous + relay decisions break behind Docker NAT).
+
+services:
+  hbbs:
+    image: rustdesk/rustdesk-server:1.1.16
+    container_name: bf-hbbs
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./data:/root
+    command: hbbs
+
+  hbbr:
+    image: rustdesk/rustdesk-server:1.1.16
+    container_name: bf-hbbr
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./data:/root
+    command: hbbr

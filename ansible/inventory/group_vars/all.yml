@@ -1,0 +1,22 @@
+# Shared variables for all Blueforce fleet hosts.
+# Fill placeholders before first production run.
+---
+# WireGuard subnet (placeholder - must match docs/08 hub topology).
+wg_subnet: "10.42.0.0/16"
+wg_interface: wg0
+wg_hub_endpoint: "vpn.example.com:51820"  # PLACEHOLDER: real hub endpoint
+
+# Monitoring endpoint (placeholder - VictoriaMetrics/Prometheus push or pull target).
+monitoring_endpoint: "http://monitoring.example.com:8428"  # PLACEHOLDER
+monitoring_job: blueforce
+
+# Update repository / mirror (placeholder - local mirror recommended for 700 devices).
+update_repo_url: "http://mirror.example.com/ubuntu"  # PLACEHOLDER
+update_repo_suite: jammy
+meg_image_tag: "1.0.0"  # pinned tag, never 'latest' (docs/10, docs/12)
+
+# Operation policy defaults. Every fleet-changing play must bind to one approved wave.
+operation_wave: ""
+operation_confirmed: false
+reboot_grace_seconds: 300
+support_bundle_dir: /var/lib/blueforce/support-bundles

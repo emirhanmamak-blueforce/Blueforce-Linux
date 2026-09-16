@@ -1,0 +1,24 @@
+---
+# Report installed versions of pinned packages (read-only).
+# Run: ansible-playbook -i inventory/hosts.yml playbooks/bf-package-check.yml --limit lab
+# Package list overridable: -e "check_packages=['docker-ce','wireguard']".
+# No Semaphore Pro feature is used.
+- name: Check installed package versions
+  hosts: blueforce
+  gather_facts: false
+  become: true
+  vars:
+    check_packages:
+      - docker-ce
+      - wireguard
+      - rustdesk
+  tasks:
+    - name: Query package versions
+      ansible.builtin.shell: "dpkg-query -W -f='${Package} ${Version}\n' {{ check_packages | join(' ') }}"
+      register: pkg_out
+      changed_when: false
+      failed_when: false
+
+    - name: Show package versions
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}:\n{{ pkg_out.stdout | default('(query failed)') }}"

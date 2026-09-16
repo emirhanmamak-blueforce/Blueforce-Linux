@@ -1,0 +1,36 @@
+[Unit]
+Description=Blueforce Field OS first-boot offline provisioning (terminal wizard)
+Documentation=file:/usr/share/doc/blueforce/firstboot/README.md
+After=multi-user.target
+# Prerequisites that must exist before the wizard may run: the seed-provided administrator
+# public key is mandatory for the offline installer. The dealer number is NOT a condition,
+# because a technician at the field console enters it through the wizard.
+ConditionPathExists=/etc/blueforce/admin-authorized-key.pub
+# Run once per machine: once the completion marker exists the unit is skipped (not failed).
+ConditionPathExists=!/var/lib/blueforce/firstboot-complete
+
+[Service]
+Type=oneshot
+Environment=BF_ADMIN_PUBLIC_KEY_FILE=/etc/blueforce/admin-authorized-key.pub
+ExecStart=/usr/local/sbin/bf-firstboot
+# The wizard reads and writes the field console. If no TTY can be set up (headless unit,
+# no console attached) systemd fails this unit and boot continues; the script itself also
+# falls back to the --dealer-id/--dealer-id-file path when no terminal is available.
+StandardInput=tty-force
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+# Upper bound so a console that nobody answers can never hold the boot job open. The
+# wizard's own input read is bounded too (BF_FIRSTBOOT_INPUT_TIMEOUT).
+TimeoutStartSec=45min
+RemainAfterExit=yes
+# Hardening that the offline installer tolerates. ProtectSystem=strict, ProtectHome=yes
+# and similar sandboxing are deliberately absent: the installer legitimately writes /etc,
+# /usr and /home/blueforce, and those options would break apt/dpkg and the user module.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

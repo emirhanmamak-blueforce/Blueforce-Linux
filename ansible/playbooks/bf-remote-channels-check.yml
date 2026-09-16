@@ -1,0 +1,267 @@
+---
+# Blueforce uzak erişim kanalı raporu -- READ-ONLY, dalga kapsamlı.
+# Ne yapar: SSH, xRDP, RustDesk, MeshCentral ve WireGuard kanallarının birim (unit) durumunu
+#           raporlar; MeshCentral ve AnyDesk OPSİYONELDİR (AnyDesk kurulu değilse açıkça
+#           "NOT INSTALLED (OPTIONAL)" yazılır). Kanonik /usr/local/bin/bf-remote-status --check
+#           çıktısı bağımsız doğrulama olarak eklenir (docs/07, docs/11 K-04).
+# Hiçbir görev durum değiştirmez: yalnız stat ve read-only CLI çıktısı okunur; tüm command
+# görevleri changed_when: false taşır.
+# Kuru koşu: ansible-playbook -i inventory/hosts.yml playbooks/bf-remote-channels-check.yml -e operation_wave=lab -e operation_confirmed=true --check
+# Koşu:      ansible-playbook -i inventory/hosts.yml playbooks/bf-remote-channels-check.yml -e operation_wave=lab -e operation_confirmed=true
+# Semaphore Pro bağımlılığı yok.
+# Dalga kapısı: operation_wave + operation_confirmed (+ production_override) rapor play'inden ÖNCE,
+# hiçbir hosta dokunmadan doğrulanır; --limit dalga ile kesişmezse koşu reddedilir (fail-closed).
+- name: Dalga ve onay kapısı -- hiçbir hosta dokunmadan önce (mutasyon yok)
+  hosts: "{{ ansible_limit | default('localhost') }}"
+  gather_facts: false
+  become: false
+  vars:
+    approved_operation_waves: [lab, pilot_1, pilot_2, wave_1, wave_2, production]
+    production_override: false
+    operation_wave_gate: "{{ operation_wave | default('invalid-wave', true) }}"
+  tasks:
+    - name: Require an approved confirmed operation wave before any host is touched
+      ansible.builtin.assert:
+        that:
+          - operation_wave_gate in approved_operation_waves
+          - operation_confirmed | default(false) | bool
+          - operation_wave_gate in groups
+          - groups[operation_wave_gate] | length > 0
+          - (operation_wave_gate != 'production') or (production_override | default(false) | bool)
+        fail_msg: "operation_wave must name a non-empty approved inventory group (lab/pilot_1/pilot_2/wave_1/wave_2/production), operation_confirmed=true is required, and production additionally requires production_override=true."
+      run_once: true
+
+    - name: Require the --limit selection to intersect the declared wave
+      ansible.builtin.assert:
+        that:
+          - (((ansible_limit | default('') | split(',') | intersect(groups[operation_wave_gate]) | length) > 0)
+            or ((ansible_limit | default('') | split(',') | select('in', groups) | map('extract', groups) | flatten | unique | intersect(groups[operation_wave_gate]) | length) > 0))
+        fail_msg: "--limit selection '{{ ansible_limit }}' does not intersect the '{{ operation_wave_gate }}' wave; refusing a mis-scoped run."
+      when:
+        - (ansible_limit | default('') | length) > 0
+        - not (ansible_limit | default('') is search('[][*?]'))
+      run_once: true
+
+- name: Uzak erişim kanallarının durumunu raporla (read-only)
+  hosts: "{{ operation_wave | default('invalid-wave', true) }}"
+  gather_facts: false
+  become: true  # Yalnız wg show ve root okuma gerektiren kanıtı (birim/state) OKUMAK için; mutasyon yok.
+  vars:
+    approved_operation_waves: [lab, pilot_1, pilot_2, wave_1, wave_2, production]
+    production_override: false
+    remote_channel_units: [ssh, sshd, xrdp, xrdp-sesman, rustdesk, meshagent, wg-quick@wg0]
+    remote_channel_props: [is-enabled, is-active]
+    remote_wg_interface: "{{ wg_interface | default('wg0') }}"
+    remote_wg_handshake_max_age: "{{ wg_handshake_max_age_seconds | default(180) }}"
+    remote_rustdesk_system_config: /etc/rustdesk/RustDesk2.toml
+    remote_rustdesk_user_config: /home/blueforce/.config/RustDesk/RustDesk2.toml
+    remote_mesh_config: /etc/meshagent/meshagent.json
+    remote_status_bin: /usr/local/bin/bf-remote-status
+  pre_tasks:
+    - name: Require confirmed approved operation wave scope
+      ansible.builtin.assert:
+        that:
+          - operation_wave in approved_operation_waves
+          - operation_confirmed | bool
+          - operation_wave in groups
+          - groups[operation_wave] | length > 0
+          - ansible_play_hosts_all | length > 0
+          - ansible_play_hosts_all | difference(groups[operation_wave]) | length == 0
+        fail_msg: "Set operation_wave to one inventory wave and operation_confirmed=true; full-fleet scope is refused."
+      run_once: true
+
+    - name: Require separate production override
+      ansible.builtin.assert:
+        that:
+          - operation_wave != 'production' or production_override | bool
+        fail_msg: "Production operation requires production_override=true in addition to operation_confirmed=true."
+      run_once: true
+  tasks:
+    - name: Kanal yapılandırma dosyalarını denetle (read-only)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ remote_rustdesk_system_config }}"
+        - "{{ remote_rustdesk_user_config }}"
+        - "{{ remote_mesh_config }}"
+        - "{{ remote_status_bin }}"
+      register: remote_channel_files
+
+    - name: Yapılandırma durumlarını yol ile indeksle
+      ansible.builtin.set_fact:
+        remote_channel_files_by_path: "{{ remote_channel_files.results | items2dict(key_name='item', value_name='stat') }}"
+
+    - name: Birim etkin/aktif durumlarını oku (systemctl, read-only)
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - "{{ item[1] }}"
+          - --quiet
+          - "{{ item[0] }}"
+      loop: "{{ remote_channel_units | product(remote_channel_props) | list }}"
+      register: remote_channel_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Birim durumlarını tek sözlükte topla
+      ansible.builtin.set_fact:
+        bf_unit_states: "{{ bf_unit_states | default({}) | combine({ item.item[0] ~ ':' ~ item.item[1]: (item.rc == 0) }) }}"
+      loop: "{{ remote_channel_probe.results }}"
+
+    - name: RustDesk paket durumunu oku (read-only)
+      ansible.builtin.command:
+        argv:
+          - dpkg-query
+          - -W
+          - -f=${Status}
+          - rustdesk
+      register: remote_rustdesk_pkg
+      changed_when: false
+      failed_when: false
+
+    - name: AnyDesk (opsiyonel) paket durumunu oku (read-only)
+      ansible.builtin.command:
+        argv:
+          - dpkg-query
+          - -W
+          - -f=${Status}
+          - anydesk
+      register: remote_anydesk_pkg
+      changed_when: false
+      failed_when: false
+
+    - name: WireGuard son handshake kaydını oku (read-only)
+      ansible.builtin.command:
+        argv:
+          - wg
+          - show
+          - "{{ remote_wg_interface }}"
+          - latest-handshakes
+      register: remote_wg_handshakes
+      changed_when: false
+      failed_when: false
+
+    - name: Kontrol saatinin epoch değerini oku (read-only)
+      ansible.builtin.command: date +%s
+      register: remote_now_epoch
+      changed_when: false
+
+    - name: Kanonik uzak erişim doğrulamasını çalıştır (bf-remote-status --check, read-only)
+      ansible.builtin.command: "{{ remote_status_bin }} --check"
+      register: remote_status_cli
+      changed_when: false
+      failed_when: false
+      when: remote_channel_files_by_path[remote_status_bin].exists | default(false)
+
+    - name: Kanal hükümlerini hesapla
+      ansible.builtin.set_fact:
+        bf_ch_ssh: >-
+          {{ 'enabled-active'
+             if ((bf_unit_states.get('ssh:is-enabled', false) | bool and bf_unit_states.get('ssh:is-active', false) | bool)
+                 or (bf_unit_states.get('sshd:is-enabled', false) | bool and bf_unit_states.get('sshd:is-active', false) | bool))
+             else 'not-ready' }}
+        bf_ch_xrdp: >-
+          {{ 'enabled-active'
+             if (bf_unit_states.get('xrdp:is-enabled', false) | bool and bf_unit_states.get('xrdp:is-active', false) | bool
+                 and bf_unit_states.get('xrdp-sesman:is-enabled', false) | bool and bf_unit_states.get('xrdp-sesman:is-active', false) | bool)
+             else 'not-ready' }}
+        bf_ch_rustdesk: >-
+          {{ 'installed-active'
+             if (remote_rustdesk_pkg.rc | default(1) == 0 and bf_unit_states.get('rustdesk:is-active', false) | bool)
+             else ('not-installed' if remote_rustdesk_pkg.rc | default(1) != 0 else 'not-ready') }}
+        bf_ch_meshcentral: >-
+          {{ 'not-configured' if not (remote_channel_files_by_path[remote_mesh_config].exists | default(false))
+             else ('configured-active'
+                   if (bf_unit_states.get('meshagent:is-enabled', false) | bool and bf_unit_states.get('meshagent:is-active', false) | bool)
+                   else 'not-ready') }}
+        bf_ch_anydesk: "{{ 'installed (optional)' if remote_anydesk_pkg.rc | default(1) == 0 else 'NOT INSTALLED (OPTIONAL)' }}"
+        bf_ch_rustdesk_config: >-
+          {{ 'configured' if (remote_channel_files_by_path[remote_rustdesk_system_config].exists | default(false)
+                              and remote_channel_files_by_path[remote_rustdesk_user_config].exists | default(false))
+             else 'not-configured' }}
+        bf_ch_canonical_ready: "{{ 'ALL-READY' if remote_status_cli.rc | default(1) == 0 else 'NOT-READY' }}"
+
+    - name: WireGuard handshake epoch listesini çıkar (read-only kanıt)
+      ansible.builtin.set_fact:
+        bf_wg_epochs: "{{ remote_wg_handshakes.stdout | default('') | regex_findall('(?m)([0-9]+)$') | map('int') | list }}"
+
+    - name: WireGuard en yeni handshake kaydını belirle
+      ansible.builtin.set_fact:
+        bf_wg_latest_epoch: "{{ (bf_wg_epochs | max | int) if bf_wg_epochs | length > 0 else 0 }}"
+
+    - name: WireGuard handshake yaşını hesapla
+      ansible.builtin.set_fact:
+        bf_wg_handshake_age: "{{ (remote_now_epoch.stdout | default('0') | int) - (bf_wg_latest_epoch | int) }}"
+
+    - name: WireGuard kanal hükmünü yaz
+      ansible.builtin.set_fact:
+        bf_ch_wireguard: >-
+          {{ 'no-handshake' if bf_wg_latest_epoch | int <= 0
+             else ('fresh-handshake' if bf_wg_handshake_age | int <= remote_wg_handshake_max_age | int else 'stale-handshake') }}
+
+    - name: Zorunlu kanal hazır/ready satırını yaz
+      ansible.builtin.set_fact:
+        bf_required_channel_line: >-
+          ssh:{{ 'READY' if bf_ch_ssh == 'enabled-active' else 'NOT-READY' }}
+          xrdp:{{ 'READY' if bf_ch_xrdp == 'enabled-active' else 'NOT-READY' }}
+          rustdesk:{{ 'READY' if bf_ch_rustdesk == 'installed-active' else 'NOT-READY' }}
+          wireguard:{{ 'READY' if bf_ch_wireguard == 'fresh-handshake' else 'NOT-READY' }}
+
+    - name: Zorunlu kanalların hazır durumunu ve sayısını belirle
+      ansible.builtin.set_fact:
+        bf_required_channel_ready: "{{ [bf_ch_ssh == 'enabled-active', bf_ch_xrdp == 'enabled-active', bf_ch_rustdesk == 'installed-active', bf_ch_wireguard == 'fresh-handshake'] | select | list | length }}"
+
+    - name: Kanal satırlarını raporla
+      ansible.builtin.debug:
+        msg:
+          - "{{ bf_device_label }} ssh={{ bf_ch_ssh }} xrdp={{ bf_ch_xrdp }} rustdesk={{ bf_ch_rustdesk }} wireguard={{ bf_ch_wireguard }}"
+          - "{{ bf_device_label }} meshcentral={{ bf_ch_meshcentral }} (opsiyonel) anydesk={{ bf_ch_anydesk }} rustdesk_config={{ bf_ch_rustdesk_config }}"
+          - "{{ bf_device_label }} hazır zorunlu kanal={{ bf_required_channel_ready }}/4 kanonik_bf_remote_status={{ bf_ch_canonical_ready }}"
+      vars:
+        bf_device_label: "{{ inventory_hostname | upper }}"
+
+    - name: Kanonik doğrulama çıktısını yaz (bağımsız kanıt)
+      ansible.builtin.debug:
+        msg: "bf-remote-status --check rc={{ remote_status_cli.rc | default(1) }} cikti={{ remote_status_cli.stdout_lines | default([]) }}"
+      when: remote_channel_files_by_path[remote_status_bin].exists | default(false)
+
+    - name: Hazır olmayan kanalı işaretle (opsiyoneller hariç)
+      ansible.builtin.debug:
+        msg: "UYARI {{ inventory_hostname | upper }}: kanal hazır değil -> {{ bf_not_ready_channels }}"
+      vars:
+        bf_not_ready_channels: >-
+          {{ (['ssh'] if bf_ch_ssh != 'enabled-active' else [])
+             + (['xrdp'] if bf_ch_xrdp != 'enabled-active' else [])
+             + (['rustdesk'] if bf_ch_rustdesk != 'installed-active' else [])
+             + (['wireguard'] if bf_ch_wireguard != 'fresh-handshake' else []) }}
+      when: bf_not_ready_channels | length > 0
+
+    - name: MeshCentral (opsiyonel) kanalının kapalı olduğunu bilgi olarak yaz
+      ansible.builtin.debug:
+        msg: "BİLGİ {{ inventory_hostname | upper }}: MeshCentral durumu={{ bf_ch_meshcentral }}; MeshCentral/AnyDesk opsiyoneldir, READY kapısının parçası değildir."
+      when: bf_ch_meshcentral != 'configured-active'
+
+    - name: Kanal başına hazır cihaz sayısını hesapla
+      ansible.builtin.set_fact:
+        bf_channel_ready_counts: "{{ bf_channel_ready_counts | default({}) | combine({ item: bf_channel_lines | select('search', item ~ ':READY') | list | length }) }}"
+      loop: [ssh, xrdp, rustdesk, wireguard]
+      vars:
+        bf_channel_lines: "{{ ansible_play_hosts_all | map('extract', hostvars, 'bf_required_channel_line') | map('default', '', true) | list }}"
+      run_once: true
+
+    - name: Dalga kanal özetini yaz
+      ansible.builtin.debug:
+        msg:
+          - "Dalga {{ operation_wave }} | raporlanan cihaz: {{ ansible_play_hosts_all | length }}"
+          - "Hazır kanal başına cihaz sayısı: {{ bf_channel_ready_counts | default({}) }}"
+          - "İki kanaldan az erişimi olan cihazlar: {{ bf_single_channel_hosts }}"
+      vars:
+        bf_single_channel_hosts: "{{ dict(ansible_play_hosts_all | zip(ansible_play_hosts_all | map('extract', hostvars, 'bf_required_channel_ready') | map('default', 0) | map('int') | list)) | dict2items | selectattr('value', 'lt', 2) | map(attribute='key') | list }}"
+      run_once: true
+
+    - name: Kanonik doğrulamada hazır olmayan cihazların dalga listesini yaz
+      ansible.builtin.debug:
+        msg: "bf-remote-status --check başarısız (merkez kanıtı dahil): {{ bf_canonical_not_ready_hosts }}"
+      vars:
+        bf_canonical_not_ready_hosts: "{{ dict(ansible_play_hosts_all | zip(ansible_play_hosts_all | map('extract', hostvars, 'bf_ch_canonical_ready') | map('default', 'NOT-READY', true) | list)) | dict2items | selectattr('value', 'equalto', 'NOT-READY') | map(attribute='key') | list }}"
+      run_once: true

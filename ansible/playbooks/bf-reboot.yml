@@ -1,0 +1,40 @@
+---
+# Controlled reboots require an approved wave and explicit confirmation.
+- name: Controlled fleet reboot
+  hosts: blueforce
+  gather_facts: false
+  become: true
+  serial: 2
+  max_fail_percentage: 0
+  any_errors_fatal: true
+  vars:
+    release_wave: ""
+    reboot_confirmed: false
+    allow_production_reboot: false
+    reboot_delay_seconds: "{{ reboot_grace_seconds | default(300) }}"
+  pre_tasks:
+    - name: Require an approved non-production release wave
+      ansible.builtin.assert:
+        that:
+          - release_wave in ['lab', 'pilot_1', 'pilot_2', 'wave_1', 'wave_2', 'production']
+          - reboot_confirmed | bool
+          - release_wave != 'production' or allow_production_reboot | bool
+        fail_msg: "Set approved release_wave and reboot_confirmed=true. Production additionally requires allow_production_reboot=true."
+
+    - name: Refuse full-fleet scope without explicit production override
+      ansible.builtin.assert:
+        that:
+          - release_wave == 'production' or ansible_limit | default('') | regex_search('(^|[:,])' ~ release_wave ~ '($|[:,])')
+        fail_msg: "Limit this reboot to the approved release_wave group; full fleet is refused."
+  tasks:
+    - name: Reboot host with grace period
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+        pre_reboot_delay: "{{ reboot_delay_seconds }}"
+        msg: Blueforce scheduled reboot via Ansible
+
+    - name: Verify host health after reboot batch
+      ansible.builtin.command: /usr/local/bin/bf-status --check
+      register: reboot_health
+      changed_when: false
+      failed_when: reboot_health.rc != 0

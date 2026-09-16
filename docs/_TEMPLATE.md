@@ -6,6 +6,16 @@
 - İlgili kararlar: `24-DECISION-LOG.md#<başlık>`
 - Durum: [ ] Taslak / [ ] İncelemede / [ ] Onaylı
 
+**Şablon kuralları (bu repoda zorunlu):**
+
+- Bölümler `## 1.` … `## 13.` sırasıyla ve atlanmadan doldurulur; ek bölümler yalnız `## Ek: <ad>` başlığıyla açılır (numaralı bölüm eklenmez).
+- Her numaralı dokümanda **en az bir Mermaid** diyagram bloğu bulunur (akış, katman, durum veya kapı diyagramı).
+- Dil: açıklamalar Türkçe; komut, dosya, servis, paket ve terim adları İngilizce kalır.
+- Her teknik iddia kaynaklıdır: KARAR bloklarında resmi kaynak URL + sürüm + doğrulama tarihi yazılır; doğrulanamayan davranış "LAB gerekli" etiketiyle açık bırakılır.
+- Dosya numarası bir kez verilir ve yeniden kullanılmaz; kararlar (`24-DECISION-LOG.md`) **append-only**dir, mevcut karar silinmez/yeniden numaralanmaz.
+- Secret yasak: örneklerde yer tutucu kullanılır (parola, private key, token, cihaz-spesifik kimlik yazılmaz).
+- Bu dosya (`_TEMPLATE.md`) numaralı değildir ve `docs-site`'a alınmaz.
+
 ---
 
 ## 1. Amaç

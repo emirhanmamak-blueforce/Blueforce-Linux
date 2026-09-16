@@ -1,0 +1,14 @@
+{
+  "_note": [
+    "Purpose: Cap Docker log disk use and keep containers alive across daemon restarts.",
+    "Docker manages firewall rules; the installer applies the mandatory DOCKER-USER deny policy.",
+    "Published application ports require explicit reviewed rules in /etc/blueforce/docker-published-port-allowlist.conf."
+  ],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "live-restore": true,
+  "iptables": true
+}

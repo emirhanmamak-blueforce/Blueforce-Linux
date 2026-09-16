@@ -1,9 +1,9 @@
 # 03 — Ubuntu Baseline
 
-> Kısa özet: Saha PC'lerinin standart zemini: Ubuntu Server 26.04.1+ LTS minimal kurulum, GNOME sonradan eklenir, terminale boot edilir, `unattended-upgrades` kapalıdır. BIOS güç-kurtarma ayarı ve GUI aç/kapa anahtarları bu dosyadadır.
+> Kısa özet: Saha PC'lerinin standart zemini: Ubuntu Server 26.04.1+ LTS minimal kurulum, GNOME masaüstü (saha standardı; XFCE yalnız LAB A/B ölçüm kolu, K-23), terminale boot edilir, `unattended-upgrades` kapalıdır. BIOS güç-kurtarma ayarı, GUI aç/kapa anahtarları ve RDP'nin her-zaman-hazır ayrımı (K-22) bu dosyadadır.
 
 - Dosya: `docs/03-UBUNTU-BASELINE.md`
-- İlgili kararlar: `24-DECISION-LOG.md#K-01` (OS/sürüm), `K-02` (GNOME), `K-03` (boot + bf-gui), `K-11` (otomatik update kapalı)
+- İlgili kararlar: `24-DECISION-LOG.md#K-01` (OS/sürüm), `K-02` (GNOME saha standardı), `K-03` (boot + bf-gui), `K-11` (otomatik update kapalı), `K-22` (RDP her zaman hazır), `K-23` (GNOME vs XFCE LAB A/B ölçümü)
 - Durum: [ ] Taslak
 
 ---
@@ -29,22 +29,26 @@ LİSANS:   Ubuntu LTS ücretsiz (ESM kapsamına bel bağlanmaz) — https://rele
 ```
 
 ```text
-KARAR:    Saha masaüstü ortamı GNOME'dur (Ubuntu Desktop standardı); XFCE elendi.
-GEREKÇE:  Kullanıcı kararı + Ubuntu Desktop standardı: tanıdık modern masaüstü, teknisyen akışıyla birebir uyum.
-ALTERNATİF: XFCE — hafif ve düşük kaynak tüketimine rağmen kullanıcı kararıyla elendi; yedekte tutulmaz.
-RİSK:     xRDP+GNOME kombinasyonu ek ayar isteyebilir (uyarı: GNOME oturumu RDP'de ek yapılandırma gerektirebilir); azaltma: 13-MEG-LINUX-ACCEPTANCE testi GNOME üzerinde koşar, `bf-gui-*` LAB'da 26.04.1 imajında doğrulanmadan dondurulmaz.
+KARAR:    Saha masaüstü ortamı GNOME'dur (Ubuntu Desktop standardı) ve bu karar yürürlüktedir. XFCE saha standardı DEĞİLDİR: elenmiş sayılmaz, K-23 uyarınca LAB'da GNOME vs XFCE A/B ölçümünde karşılaştırma koludur ve karar ölçüm verisiyle revize edilebilir.
+GEREKÇE:  Kullanıcı kararı + Ubuntu Desktop standardı: tanıdık modern masaüstü, teknisyen akışıyla birebir uyum. RDP oturumu + headless RustDesk + düşük RAM'li mini PC koşulları ölçülmeden "tek doğru masaüstü" iddiası kanıtsız kalır; bu yüzden GNOME baseline olarak sabit tutulur, XFCE yalnız LAB ölçüm koluna alınır (ölçüm seti: RAM, CPU, boot süresi, RDP güvenilirliği, RustDesk reboot sonrası davranış, login screen erişimi, dummy display, 24/72 saat stabilite). Ölçüm seti ve 24/72 saat süreleri sabittir; XFCE kolu saha medyasına girmez. RustDesk headless ZORUNLU şartı her iki kolda da aynen korunur.
+ALTERNATİF: XFCE — hafif ve düşük kaynak tüketimine rağmen saha standardı değildir (K-02); K-23 uyarınca LAB yedek/karşılaştırma koludur, revizyon yalnız ölçüm verisiyle yapılır. XFCE'yi doğrudan saha standardı yapmak kullanıcı kararı dışı ve kanıtsız olduğu için reddedildi; XFCE'yi tamamen kapatmak da ölçüm şansını yok ettiği için reddedildi.
+RİSK:     xRDP+GNOME kombinasyonu ek ayar isteyebilir (uyarı: GNOME oturumu RDP'de ek yapılandırma gerektirebilir); azaltma: 13-MEG-LINUX-ACCEPTANCE testi GNOME üzerinde koşar, `bf-gui-*` LAB'da 26.04.1 imajında doğrulanmadan dondurulmaz. A/B ölçümü ek LAB zamanı ve iki masaüstü bakım yükü getirir; azaltma: ölçüm seti/süreleri sabit ve sonuç tek tabloda LAB release kaydına bağlıdır.
 MALİYET:  Ücretsiz.
-LİSANS:   GNOME (GPL/LGPL bileşenler), ücretsiz — https://www.gnome.org/ (doğrulanma: 2026-09-15).
+LİSANS:   GNOME (GPL/LGPL bileşenler), ücretsiz — https://www.gnome.org/ (doğrulanma: 2026-09-15; yeniden doğrulama: 2026-09-16, HTTP 200); XFCE GPL — https://xfce.org/ (doğrulama: 2026-09-16, HTTP 200; yalnız LAB A/B ölçüm adayıdır, saha standardı değildir).
 ```
 
+> **Güncelleme (2026-09-16, K-23):** Yukarıdaki "XFCE elendi / yedekte tutulmaz" ifadesi geçersizdir. Doğru ifade: **GNOME seçildi ve saha standardı olarak kalır; XFCE LAB A/B ölçümünde karşılaştırılır.** Ölçüm verisi gelmeden revizyon yapılmaz; revizyon 24-DECISION-LOG PR'ı ile işlenir. Ayrıntı: `24-DECISION-LOG.md#K-23`.
+
 ```text
-KARAR:    Cihazlar terminale (multi-user) boot eder; grafik katman `bf-gui-on` / `bf-gui-off` ile systemd üzerinden açılıp kapatılır.
-GEREKÇE:  xRDP mimarisi oturum yöneticisi (sesman) + systemd servis birimleri (`xrdp`, `xrdp-sesman`) üzerine kuruludur; GUI, display-manager + xRDP servisleri üzerinden yönetilebilir bir katman olarak modellenir. Varsayılan kapalı GUI = düşük RAM, düşük saldırı yüzeyi, öngörülebilir boot.
-ALTERNATİF: Her zaman grafik boot — kaynak israfı ve 700 cihazda gereksiz hata yüzeyi nedeniyle elendi.
-RİSK:     Kesin birim adları ve GNOME oturum başlatma satırı 26.04.1'e göre değişebilir; azaltma: LAB'da 26.04.1 imajında doğrulanmadan `bf-gui-*` dondurulmaz.
+KARAR:    Cihazlar terminale (multi-user) boot eder. `xrdp` + `xrdp-sesman` multi-user seviyesinde HER ZAMAN enable ve active kalır (RDP kanalı `bf-gui-on` beklemez); `bf-gui-on` / `bf-gui-off` yalnız YEREL FİZİKSEL grafik katmanını (display-manager: gdm3/gdm/sddm/lightdm + default target) systemd üzerinden açar/kapatır. GUI kapalı ≠ RDP kapalı.
+GEREKÇE:  xRDP mimarisi oturum yöneticisi (sesman) + systemd servis birimleri (`xrdp`, `xrdp-sesman`) üzerine kuruludur. xRDP'nin servis seviyesinde sürekli hazır olması, yerel GUI kapalı saha cihazında uzaktan grafik kurtarma kanalını korur (sahaya gitme oranını düşürür); `bf-gui-*` yalnız gereksiz yerel grafik katmanını yönetir. Varsayılan kapalı yerel GUI = düşük RAM, düşük saldırı yüzeyi, öngörülebilir boot.
+ALTERNATİF: RDP'yi `bf-gui-on`'a bağlamak — GUI kapalıyken uzaktan grafik kurtarma kaybolur → reddedildi; her zaman grafik boot — kaynak israfı ve 700 cihazda gereksiz hata yüzeyi nedeniyle elendi.
+RİSK:     Kesin birim adları ve GNOME oturum başlatma satırı 26.04.1'e göre değişebilir; azaltma: LAB'da 26.04.1 imajında doğrulanmadan `bf-gui-*` dondurulmaz. `bf-gui-off` içinde xRDP'i durduran bir satır bulunursa bu sözleşme ihlalidir (`tests/check-specs.sh` bunu zorunlu tutar).
 MALİYET:  Ücretsiz.
-LİSANS:   xRDP Apache-2.0, ücretsiz — https://github.com/neutrinolabs/xrdp (v0.10.6.1, 2026-07-07; doğrulanma: 2026-09-15).
+LİSANS:   xRDP Apache-2.0, ücretsiz — https://github.com/neutrinolabs/xrdp (v0.10.6.1, 2026-07-07; doğrulanma: 2026-09-15; yeniden doğrulama: 2026-09-16, HTTP 200).
 ```
+
+> **Güncelleme (2026-09-16, K-22):** Bu bloktaki "GUI, display-manager + xRDP servisleri üzerinden yönetilir" ifadesi K-22 ile kesinleştirilmiştir: **`xrdp`/`xrdp-sesman` her zaman enable+active; `bf-gui-on`/`bf-gui-off` yalnız yerel fiziksel GUI'yi (display-manager + default target) yönetir; `bf-gui-off` xRDP servislerini asla durdurmaz veya disable etmez.** Ayrıntı ve kod kanıtı: `24-DECISION-LOG.md#K-22`.
 
 ```text
 KARAR:    Golden image'da `unattended-upgrades` kapatılır (`/etc/apt/apt.conf.d/20auto-upgrades` değerleri `0` + `apt-daily*.timer` maskeleme).
@@ -57,7 +61,7 @@ LİSANS:   Yok (OS yapılandırması) — https://ubuntu.com/server/docs/how-to/
 
 ## 4. Neden Bu Karar?
 
-Server minimal kurulum + sonradan GNOME (Ubuntu Desktop standardı, kullanıcı kararı). Terminale boot, 700 cihazın varsayılan durumunu en öngörülebilir hale getirir; grafik yalnızca bakım penceresinde açılır. Otomatik update'in kapatılması, update zincirinin (10-UPDATE) "onay olmadan değişim yok" ilkesinin teknik kilididir.
+Server minimal kurulum + sonradan GNOME (Ubuntu Desktop standardı, kullanıcı kararı; XFCE saha standardı değil, yalnız K-23 LAB A/B ölçüm kolu). Terminale boot, 700 cihazın varsayılan durumunu en öngörülebilir hale getirir; yerel grafik yalnızca bakım penceresinde açılır — uzaktan grafik erişim (xRDP) ise her zaman hazırdır (K-22), yani "yerel GUI kapalı" bir erişim kaybı değildir. Otomatik update'in kapatılması, update zincirinin (10-UPDATE) "onay olmadan değişim yok" ilkesinin teknik kilididir.
 
 ## 5. Alternatifler
 
@@ -65,8 +69,8 @@ Server minimal kurulum + sonradan GNOME (Ubuntu Desktop standardı, kullanıcı 
 |---|---|---|---|
 | Ubuntu 24.04 LTS | Olgun donanım desteği | Daha kısa destek penceresi | Yedek |
 | Ubuntu Desktop 26.04 | Tek adımda GUI | 6 GB RAM şartı, şişkin zemin | Elendi |
-| XFCE | Hafif, düşük kaynak | Kullanıcı kararıyla elendi (saha standardı GNOME) | Elendi |
-| Her zaman grafik boot | Teknisyen rahatlığı | Kaynak israfı, geniş hata yüzeyi | Elendi |
+| XFCE | Hafif, düşük kaynak | Saha standardı değil (GNOME baseline, K-02); yalnız ölçüm kolu | LAB A/B ölçüm adayı (K-23) |
+| Yerel GUI her zaman açık | Teknisyen rahatlığı | Kaynak israfı, geniş hata yüzeyi (RDP'yi etkilemez) | Elendi |
 
 ## 6. Avantajlar
 
@@ -77,7 +81,7 @@ Server minimal kurulum + sonradan GNOME (Ubuntu Desktop standardı, kullanıcı 
 ## 7. Dezavantajlar
 
 - GNOME oturum başlatma satırı ve display-manager birim adları 26.04.1'e göre LAB'da doğrulanmadan dondurulamaz.
-- Teknisyen grafik istediğinde ek komut (`bf-gui-on`) gerekir — runbook'a işlenir.
+- Teknisyen **yerel fiziksel** ekran istediğinde ek komut (`bf-gui-on`) gerekir — runbook'a işlenir; uzaktan grafik (RDP) için bu komut gerekmez, xRDP her zaman hazırdır (K-22).
 
 ## 8. Riskler
 
@@ -86,12 +90,14 @@ Server minimal kurulum + sonradan GNOME (Ubuntu Desktop standardı, kullanıcı 
 | 26.04.x sürücü farkı heterojen donanımda | Orta | Orta | LAB profil testi (04) |
 | `bf-gui-*` birim adları 26.04.1'de farklı | Orta | Düşük | LAB doğrulaması, §13 açık soru |
 | `unattended-upgrades` açık unutulur | Orta | Yüksek | final-check + monitoring metriği |
+| `bf-gui-off` yanlış yazılıp xRDP'i durdurur (uzaktan kurtarma kaybı) | Düşük | Yüksek | `tests/check-specs.sh` `systemctl stop/disable xrdp*` görürse testi düşürür; 08-rdp check'i active xrdp ister (K-22) |
+| GNOME/XFCE kararı kanıtsız revize edilir | Düşük | Orta | A/B ölçüm seti sabit; revizyon yalnız LAB verisiyle ve PR ile (K-23) |
 
 ## 9. Uygulama Planı
 
 1. BIOS ayarı (her saha PC'sinde, elektrik kesintisi sonrası otomatik açılış için):
    - `Restore on AC Power Loss = Power On` (üretici menüsünde `After Power Loss: Power On` / `AC Recovery: Power On` adlarıyla da geçer; teknisyen imaj öncesi menüden doğrular).
-2. Ubuntu Server 26.04.1+ minimal kurulum (GUI seçilmez).
+2. V1 medya: TEK USB **Blueforce Field OS ISO** (`dist/Blueforce-Field-OS-<version>-amd64.iso`); ISO içinde autoinstall (kurulum motoru) + offline APT repo + firstboot bulunur ve kimliksiz zemin kurulur (`unattended-upgrades` kapalıdır). `interactive-sections: [storage]` korunur: kurulum katılımsız ilerler ama diski operatör seçer/onaylar, otomatik disk silme YOKTUR. Geri dönüş yolu her zaman sıcaktır: resmi upstream ISO + NoCloud seed USB (K-20). Medya üretimi ve doğrulaması 26'da, boot kabulü LAB'dadır.
 3. Boot hedefi terminale sabitlenir:
 
 ```bash
@@ -108,11 +114,11 @@ sudo systemctl enable xrdp xrdp-sesman
 echo "gnome-session" > ~/.xsession
 ```
 
-5. GUI aç/kapa anahtarları (kurucu tarafından `/usr/local/bin/` altına yazılır):
+5. GUI aç/kapa anahtarları (kurucu tarafından `/usr/local/bin/` altına yazılır; **yalnız yerel fiziksel GUI**, K-22):
 
 ```bash
-sudo bf-gui-on    # display-manager + xrdp/xrdp-sesman başlatılır, RDP oturumu açılır
-sudo bf-gui-off   # grafik katman durdurulur, cihaz terminale döner
+sudo bf-gui-on    # yalnız display-manager (yerel fiziksel oturum) başlatılır; RDP zaten hazırdır
+sudo bf-gui-off   # yerel grafik katman durdurulur, cihaz terminale döner; xrdp/xrdp-sesman ACTIVE KALIR
 ```
 
 6. Otomatik update kapatılır:
@@ -124,7 +130,8 @@ sudo bf-gui-off   # grafik katman durdurulur, cihaz terminale döner
 sudo systemctl mask apt-daily.timer apt-daily-upgrade.timer
 ```
 
-7. Açılışta koşması beklenen servisler (final-check bunları denetler): `NetworkManager` (veya `systemd-networkd`), `wg-quick@wg0`, `docker`, `xrdp`+`xrdp-sesman` (yalnızca GUI-açık modda), `node_exporter`, RustDesk/MeshCentral agent, `bf-health-push.timer`.
+7. Açılışta koşması beklenen servisler (final-check bunları denetler): `NetworkManager` (veya `systemd-networkd`), `wg-quick@wg0`, `docker`, `xrdp`+`xrdp-sesman` (**her zaman enable/ready; yerel GNOME display-manager durumu bundan bağımsız**), `node_exporter`, RustDesk/MeshCentral agent, `bf-health-push.timer`. Ubuntu 26.04.1 GNOME+xRDP kesin oturum davranışı LAB ile doğrulanmalıdır.
+8. GNOME vs XFCE A/B ölçümü (LAB, K-23): aynı donanımda iki kol kurulur ve sabit ölçüm seti doldurulur — RAM, CPU, boot süresi, RDP güvenilirliği, RustDesk reboot sonrası davranışı, login screen erişimi, dummy display davranışı, 24 saat + 72 saat stabilite. RustDesk headless zorunlu şartı iki kolda da aranır; sonuç tablosu LAB release kaydına bağlanır. XFCE kolu saha medyasına girmez; revizyon yalnız bu veriyle yapılır.
 
 ## 10. Test Planı
 
@@ -132,8 +139,11 @@ sudo systemctl mask apt-daily.timer apt-daily-upgrade.timer
 |---|---|---|
 | `get-default` | `multi-user.target` | LAB(2) |
 | Güç kesintisi simülasyonu | BIOS ayarı ile cihaz kendiliğinden açılır | LAB(2) |
-| `bf-gui-on/off` sonrası RDP | GNOME oturumu açılır/kapanır | LAB(2) |
+| `bf-gui-on/off` sonrası yerel grafik | Yerel oturum açılır/kapanır (display-manager) | LAB(2) |
+| `bf-gui-off` sonrası xRDP | `xrdp`/`xrdp-sesman` **active kalır**, RDP oturumu kurulur (K-22) | LAB(2) |
 | `20auto-upgrades` değerleri `0`, timer'lar maskeli | Otomatik apt çalışmaz | LAB(2) imaj denetimi |
+| GNOME vs XFCE A/B ölçümü (8 metrik, 24/72 saat) | Tablo dolar; karar LAB verisiyle verilir (K-23) | LAB(2) |
+| Tek-USB Field OS ISO ile kurulum (03 zemini) | Kimliksiz zemin kurulur, storage operatör onayı beklenir (K-20) | LAB(2) UEFI+Legacy |
 
 ## 11. Rollback
 
@@ -146,13 +156,16 @@ sudo systemctl mask apt-daily.timer apt-daily-upgrade.timer
 - [ ] ISO sürümü 26.04.1+ (LAB'da `lsb_release -a` çıktısı kayıtlı).
 - [ ] BIOS `Restore on AC Power Loss = Power On` her profilde doğrulandı.
 - [ ] `get-default` = `multi-user.target`.
-- [ ] `bf-gui-on/off` LAB 26.04.1 imajında test edildi.
+- [ ] `bf-gui-on/off` LAB 26.04.1 imajında test edildi; `bf-gui-off` sonrası xRDP hâlâ active (K-22).
 - [ ] `unattended-upgrades` kapalı + timer'lar maskeli.
+- [ ] GNOME vs XFCE A/B ölçüm tablosu (8 metrik) doldurulmuş; XFCE saha medyasına girmemiş (K-23).
 
 ## 13. Açık Sorular
 
 - [ ] GNOME oturum başlatma satırı + `bf-gui-*` kesin birim listesi — LAB 26.04.1 imajında (sahibi: Faz 3).
 - [ ] `NetworkManager` vs `systemd-networkd` seçimi — netplan profiliyle birlikte LAB'da netleşecek (sahibi: Faz 3, 08 yazarı).
+- [ ] GNOME vs XFCE A/B ölçüm seti ve sonuç tablosu (8 metrik, 24/72 saat) — LAB 2 cihaz (sahibi: platform ekibi + bu dosyanın yazarı) [K-23].
+- [ ] Medya tabanı sapması: LAB ISO'su Desktop flavour ile üretildi; işletim öncesi Server ISO ile yeniden build ya da Desktop tabanının kabulü — LAB/F2B (sahibi: release yöneticisi) [K-20].
 
 ---
 
@@ -160,8 +173,12 @@ sudo systemctl mask apt-daily.timer apt-daily-upgrade.timer
 
 ```mermaid
 flowchart TB
-    ISO["Ubuntu Server 26.04.1+ ISO<br/>(GUI'siz minimal)"] --> BOOT["Boot hedefi: multi-user.target<br/>(terminale boot)"]
-    BOOT --> GUI["GUI katmanı (kapalı varsayılan)<br/>GNOME + xRDP + bf-gui-on/off"]
-    GUI --> KILIT["Update kilidi<br/>unattended-upgrades kapalı + timer maskeli"]
+    ISO["V1 medya: tek USB Field OS ISO<br/>(autoinstall.yaml + offline APT + firstboot)<br/>geri dönüş: upstream ISO + NoCloud seed"] --> BOOT["Boot hedefi: multi-user.target<br/>(terminale boot; yerel GUI kapalı varsayılan)"]
+    BOOT --> GUI["Yerel GUI katmanı (kapalı varsayılan)<br/>GNOME + bf-gui-on/off"]
+    BOOT --> RDP["xRDP servisi HER ZAMAN hazır<br/>xrdp + xrdp-sesman enable+active (K-22)"]
+    GUI -.->|"bf-gui-off xRDP'i DURDURMAZ"| RDP
+    RDP --> KILIT["Update kilidi<br/>unattended-upgrades kapalı + timer maskeli"]
+    GUI --> KILIT
     KILIT --> SERVIS["Açılış servisleri<br/>wg-quick + docker + node_exporter + agent'lar"]
+    SERVIS --> AB["LAB A/B: GNOME vs XFCE<br/>8 metrik + 24/72 saat (K-23)"]
 ```

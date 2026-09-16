@@ -91,7 +91,7 @@ LİSANS:   systemd-journald / textfile (Apache-2.0) — https://github.com/prome
 1. Merkez: Prometheus + Grafana OSS + Uptime Kuma kurulur.
 2. Saha: Node Exporter + textfile cron/timer + Kuma Push kurulur.
 3. Etiket şeması `device_id="BF-<no>"` tüm metriklerde uygulanır.
-4. `bf-status` / `bf-diagnostics` / `bf-support-bundle` sahaya dağıtılır.
+4. `bf-status` / `bf-diagnostics` / `bf-support-bundle` sahaya dağıtılır. `bf-status`, yaşam döngüsü durumunu açık gösterir: offline kurulum `PROVISIONED_OFFLINE`, token sonrası `ENROLLED`, Prometheus/Kuma + WireGuard + erişim doğrulanınca `READY` (27/29).
 
 ```bash
 # saha: Node Exporter + textfile dizini (örnek)

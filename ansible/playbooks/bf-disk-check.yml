@@ -1,0 +1,29 @@
+---
+# Check disk usage (read-only) and warn above threshold.
+# Run: ansible-playbook -i inventory/hosts.yml playbooks/bf-disk-check.yml --limit lab
+# Threshold overridable: -e disk_warn_pct=80.
+# No Semaphore Pro feature is used.
+- name: Check disk usage
+  hosts: blueforce
+  gather_facts: false
+  vars:
+    disk_warning_percent: "{{ disk_warn_pct | default(80) }}"
+  tasks:
+    - name: Get disk usage
+      ansible.builtin.command: df -h --output=source,pcent,target
+      register: df_out
+      changed_when: false
+
+    - name: Show disk usage
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}:\n{{ df_out.stdout }}"
+
+    - name: Get root filesystem usage percentage
+      ansible.builtin.shell: "df --output=pcent / | tail -n 1 | tr -dc '0-9'"
+      register: root_pct
+      changed_when: false
+
+    - name: Flag hosts above threshold
+      ansible.builtin.debug:
+        msg: "WARNING {{ inventory_hostname }} root disk {{ root_pct.stdout }}% exceeds {{ disk_warning_percent }}%"
+      when: root_pct.stdout | int >= (disk_warning_percent | int)

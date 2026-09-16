@@ -101,8 +101,9 @@ Hostname:  bf-12010193
 bf-status
 ```
 
-3. Ekranda **READY** (veya tüm satırlar yeşil/OK) görmelisin.
-4. Kontrol listesini doldur (§12), sahadan çık.
+3. Offline medya ile kurulumda önce **PROVISIONED_OFFLINE** görmen normaldir; bu durumda cihaz READY değildir. İnternet geldiğinde merkezden tek-kullanımlık enrollment token iste ve 29'daki adımı uygula.
+4. Token sonrası **ENROLLED** görünür; WireGuard, remote ve monitoring merkezi doğrulaması bitince **READY** görmelisin.
+5. READY sonrası kontrol listesini doldur (§12), sahadan çık.
 
 ### B. Arızalı cihaza gittin — ilk 3 hareket
 

@@ -1,0 +1,25 @@
+---
+# Restart the WireGuard tunnel interface.
+# Run: ansible-playbook -i inventory/hosts.yml playbooks/bf-wireguard-restart.yml --limit lab
+# Uses wg_interface from group_vars and defaults to wg0.
+# No Semaphore Pro feature is used.
+- name: Restart WireGuard tunnel
+  hosts: blueforce
+  gather_facts: false
+  become: true
+  vars:
+    wireguard_restart_interface: "{{ wg_interface | default('wg0') }}"
+  tasks:
+    - name: Restart WireGuard service
+      ansible.builtin.systemd:
+        name: "wg-quick@{{ wireguard_restart_interface }}"
+        state: restarted
+
+    - name: Verify tunnel state
+      ansible.builtin.command: "wg show {{ wireguard_restart_interface }}"
+      register: wg_out
+      changed_when: false
+
+    - name: Show WireGuard state
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ wg_out.stdout_lines | default([]) }}"

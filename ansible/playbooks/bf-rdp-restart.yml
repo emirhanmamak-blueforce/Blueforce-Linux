@@ -1,0 +1,25 @@
+---
+# Restart the RDP service (xrdp).
+# Run: ansible-playbook -i inventory/hosts.yml playbooks/bf-rdp-restart.yml --limit lab
+# Service name is overridable via rdp_service_name.
+# No Semaphore Pro feature is used.
+- name: Restart RDP service
+  hosts: blueforce
+  gather_facts: false
+  become: true
+  vars:
+    rdp_restart_service: "{{ rdp_service_name | default('xrdp') }}"
+  tasks:
+    - name: Restart RDP
+      ansible.builtin.systemd:
+        name: "{{ rdp_restart_service }}"
+        state: restarted
+
+    - name: Verify RDP is active
+      ansible.builtin.command: "systemctl is-active {{ rdp_restart_service }}"
+      register: rdp_state
+      changed_when: false
+
+    - name: Show RDP state
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} rdp={{ rdp_state.stdout }}"

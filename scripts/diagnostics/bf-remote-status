@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Independently verify remote, network, and central evidence; never trusts READY state.
+set -euo pipefail
+STATE_FILE="${BF_STATE_FILE:-/var/lib/blueforce/state.json}"
+RUSTDESK_SYSTEM_CONFIG="${BF_RUSTDESK_SYSTEM_CONFIG:-/etc/rustdesk/RustDesk2.toml}"
+RUSTDESK_USER_CONFIG="${BF_RUSTDESK_USER_CONFIG:-/home/blueforce/.config/RustDesk/RustDesk2.toml}"
+MESH_CONFIG="${BF_MESH_CONFIG:-/etc/meshagent/meshagent.json}"
+MAX_AGE="${BF_WG_HANDSHAKE_MAX_AGE:-180}"
+CHECK_MODE=0
+[[ "${1:-}" == --check && $# -eq 1 ]] && CHECK_MODE=1
+[[ $# -eq 0 || "$CHECK_MODE" == 1 ]] || { echo 'Usage: bf-remote-status [--check]' >&2; exit 2; }
+[[ "$MAX_AGE" =~ ^[1-9][0-9]*$ ]] || { echo 'BF_WG_HANDSHAKE_MAX_AGE must be positive seconds' >&2; exit 2; }
+valid_endpoint() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*(:[1-9][0-9]{0,4})?$ ]] && [[ "$1" != *example* && "$1" != *invalid* && "$1" != *'<'* && "$1" != *'>'* && "$1" != localhost* ]]; }
+rustdesk_configured() {
+  local endpoint
+  endpoint="$(sed -n "s/^rendezvous-server = '\([^']*\)'$/\1/p" "$RUSTDESK_SYSTEM_CONFIG" 2>/dev/null | head -1)"
+  valid_endpoint "$endpoint" && grep -Fqx "relay-server = '$endpoint'" "$RUSTDESK_SYSTEM_CONFIG" && grep -Fqx "rendezvous-server = '$endpoint'" "$RUSTDESK_USER_CONFIG" && grep -Fqx "relay-server = '$endpoint'" "$RUSTDESK_USER_CONFIG"
+}
+wg_fresh() { wg show wg0 latest-handshakes 2>/dev/null | awk -v now="$(date +%s)" -v max="$MAX_AGE" '$2 > 0 && now-$2 <= max {ok=1} END {exit !ok}'; }
+central_verified() { python3 - "$STATE_FILE" <<'PY'
+import json,sys
+try:
+    c=json.load(open(sys.argv[1],encoding='utf-8'))['central_verification']
+    ok=(c.get('status')=='verified' and bool(c.get('verification_id')) and all(isinstance(c.get(n),dict) and c[n].get('status')=='verified' and bool(c[n].get('verification_id')) for n in ('monitoring','remote','management')))
+    raise SystemExit(0 if ok else 1)
+except Exception: raise SystemExit(1)
+PY
+}
+fail=0
+systemctl is-enabled --quiet xrdp 2>/dev/null && systemctl is-active --quiet xrdp 2>/dev/null && systemctl is-enabled --quiet xrdp-sesman 2>/dev/null && systemctl is-active --quiet xrdp-sesman 2>/dev/null && xrdp='enabled-active' || { xrdp='not-ready'; fail=1; }
+dpkg-query -W -f='${Status}' rustdesk 2>/dev/null | grep -q 'install ok installed' && rustdesk_configured && rustdesk='configured' || { rustdesk='not-ready'; fail=1; }
+wg_fresh && wireguard='fresh-handshake' || { wireguard='not-ready'; fail=1; }
+if [[ -e "$MESH_CONFIG" ]]; then systemctl is-enabled --quiet meshagent 2>/dev/null && systemctl is-active --quiet meshagent 2>/dev/null && mesh='configured-active' || { mesh='not-ready'; fail=1; }; else mesh='not-configured'; fi
+central_verified && central='verified' || { central='PENDING'; fail=1; }
+printf 'xRDP: %s\nRustDesk: %s\nWireGuard: %s\nMesh: %s\nCentral verification: %s\n' "$xrdp" "$rustdesk" "$wireguard" "$mesh" "$central"
+[[ "$fail" -eq 0 ]]

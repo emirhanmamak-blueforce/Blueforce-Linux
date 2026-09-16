@@ -1,0 +1,13 @@
+[Unit]
+Description=Blueforce persistent Docker published-port firewall
+BindsTo=docker.service
+PartOf=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/blueforce-docker-firewall
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

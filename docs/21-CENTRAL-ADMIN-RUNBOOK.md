@@ -102,7 +102,7 @@ ansible-playbook playbooks/update.yml --limit wave_p1
 ### Günlük / haftalık rutinler
 
 - Günlük (operatör, 10 dk): Uptime Kuma UP/DOWN, Prometheus `up` == 0 listesi, gece reboot olanlar, yedek job durumu.
-- Haftalık (yönetici, 30 dk): dalga takvimi, açık halt'lar, anahtar/envanter uyumsuzlukları, L9 tatbikat sayacı.
+- Haftalık (yönetici, 30 dk): dalga takvimi, açık halt'lar, anahtar/envanter uyumsuzlukları, `PROVISIONED_OFFLINE`/`ENROLLED` bekleyen cihaz kuyruğu, release manifest/rollback kanıtı ve L9 tatbikat sayacı (27/29/30).
 
 ## 10. Test Planı
 

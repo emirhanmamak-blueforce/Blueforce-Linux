@@ -1,0 +1,4 @@
+---
+# Defaults for the common role. Override in group_vars/host_vars, never hardcode secrets here.
+common_timezone: Europe/Istanbul
+common_admin_user: blueforce

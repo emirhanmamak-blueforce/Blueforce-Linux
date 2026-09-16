@@ -1,0 +1,10 @@
+# Purpose: Manually return a field device to terminal mode after maintenance.
+# This unit is deliberately not enabled by any boot target.
+[Unit]
+Description=Blueforce GUI off (manual terminal maintenance switch)
+After=graphical.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bf-gui-off
+RemainAfterExit=no

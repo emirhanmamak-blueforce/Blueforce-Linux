@@ -1,0 +1,12 @@
+---
+# Docker is installed only when an operator supplies a verified repository and exact version.
+# Supported Ubuntu releases include 24.04 noble and 26.04 resolute; no release is hard-coded.
+docker_supported_codenames:
+  - noble
+  - resolute
+docker_apt_codename: "{{ ansible_distribution_release | default('') }}"
+docker_apt_repository: ""  # Required: approved, already key-verified Docker APT repository.
+docker_engine_version: ""  # Required exact version, e.g. 5:29.0.0-1~ubuntu.26.04~resolute.
+docker_packages: []
+meg_container_name: meg
+meg_image_tag: 1.0.0
